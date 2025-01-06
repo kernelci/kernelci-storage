@@ -1,0 +1,58 @@
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+  
+name: Build and release
+jobs:
+  build_and_test:
+    name: Rust project - latest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        targets:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add dependencies (ssl-dev, etc)
+        run: sudo apt-get install libssl-dev pkg-config
+      - name: Install aarch64-buildroot-linux-gnu-gcc for relevant target
+        if: matrix.targets == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get install gcc-aarch64-linux-gnu
+      - name: Install aarch64-buildroot-linux-musl-gcc for relevant target
+        if: matrix.targets == 'aarch64-unknown-linux-musl'
+        run: sudo apt-get install gcc-aarch64-linux-musl
+      - name: Install musl-gcc for relevant target
+        if: matrix.targets == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install musl-tools       
+
+      - run: rustup target add ${{ matrix.targets }}
+      - run: rustup update stable && rustup default stable
+      - run: cargo build --verbose --target ${{ matrix.targets }}
+      - name: release
+        uses: actions/create-release@v1
+        id: create_release
+        with:
+          draft: false
+          prerelease: false
+          release_name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ github.ref }}
+          body_path: CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: target/${{ matrix.targets }}/kernelci-storage
+          asset_name: kernelci-storage
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      
+  
