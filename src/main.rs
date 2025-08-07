@@ -571,6 +571,44 @@ async fn ax_get_file(
     );
 
     headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
+    // add e-tag header from received_file.headers
+    if let Some(etag) = upstream_headers.get("ETag") {
+        headers.insert(header::ETAG, etag.clone());
+    }
+    // add last-modified header
+    if let Some(last_modified) = upstream_headers.get("Last-Modified") {
+        headers.insert(header::LAST_MODIFIED, last_modified.clone());
+    }
+
+    // TODO: rxheaders.get is case sensitive or not?
+    // Does request have If-None-Match header?
+    if let Some(if_none_match) = rxheaders.get("If-None-Match") {
+        // §13.1.2, last paragraph, RFC 9110
+        if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+            return (StatusCode::PRECONDITION_FAILED, "Method Not Allowed").into_response();
+        }
+        if let Some(etag) = upstream_headers.get("ETag") {
+            if if_none_match == etag {
+                println!(
+                    "{:?} 304 0 {} {} {} {}",
+                    remote_addr, human_time, method, filepath, user_agent_str
+                );
+                return (StatusCode::NOT_MODIFIED, headers, Body::empty()).into_response();
+            }
+        }
+    // Does request have If-Modified-Since header?
+    } else if let Some(if_modified_since) = rxheaders.get("If-Modified-Since") {
+        if let Some(last_modified) = upstream_headers.get("Last-Modified") {
+            // TODO: Validate properly last_modified
+            if if_modified_since == last_modified {
+                println!(
+                    "{:?} 304 0 {} {} {} {}",
+                    remote_addr, human_time, method, filepath, user_agent_str
+                );
+                return (StatusCode::NOT_MODIFIED, headers, Body::empty()).into_response();
+            }
+        }
+    }
 
     /* Usually HEAD is used to check if the file exists and range is supported */
     if method == axum::http::Method::HEAD {
@@ -581,6 +619,7 @@ async fn ax_get_file(
         );
         return (headers, Body::empty()).into_response();
     }
+
     match tokio::fs::File::open(&cached_file).await {
         Ok(mut file) => {
             let mut start = 0;
