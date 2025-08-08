@@ -19,6 +19,5 @@ jobs:
 #        run: |
 #         docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/nuclearcat/kernelci-storage:latest --push .
         run: |
-         docker buildx build --platform linux/amd64 -t ghcr.io/nuclearcat/kernelci-storage:latest --push .
-      
+         docker buildx build --platform linux/amd64 -t ghcr.io/kernelci/kernelci-storage:latest --push .
 
