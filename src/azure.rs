@@ -166,7 +166,8 @@ fn save_headers_to_file(filename: String, headers: HeaderMap) {
     match f {
         Ok(mut f) => {
             for (key, value) in headers.iter() {
-                let line = format!("{}:{}\n", key, value.to_str().unwrap());
+                let key_lower = key.as_str().to_lowercase();
+                let line = format!("{}:{}\n", key_lower, value.to_str().unwrap());
                 // TBD: Filter out some names?
                 f.write_all(line.as_bytes()).unwrap();
             }
