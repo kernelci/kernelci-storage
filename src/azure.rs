@@ -149,11 +149,10 @@ fn get_headers_from_file(filename: String) -> HeaderMap {
     let mut headers = HeaderMap::new();
     let file_content = read_to_string(filename).unwrap();
     for line in file_content.lines() {
-        // Use the variable here
-        let parts: Vec<&str> = line.split(":").collect();
-        if parts.len() == 2 {
-            let key = HeaderName::from_bytes(parts[0].trim().as_bytes()).unwrap();
-            let value = HeaderValue::from_str(parts[1].trim()).unwrap();
+        // Split only on the first ':' so values like times (HH:MM:SS) are preserved
+        if let Some((name, value)) = line.split_once(':') {
+            let key = HeaderName::from_bytes(name.trim().as_bytes()).unwrap();
+            let value = HeaderValue::from_str(value.trim()).unwrap();
             headers.insert(key, value);
         }
     }
