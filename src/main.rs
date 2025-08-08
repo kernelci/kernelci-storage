@@ -67,6 +67,7 @@ struct Args {
 // const names for last-modified and etag in lowercase
 const LAST_MODIFIED: &str = "last-modified";
 const ETAG: &str = "etag";
+const CONTENT_TYPE: &str = "content-type";
 
 type FileSemaphores = Arc<RwLock<HashMap<String, Arc<Semaphore>>>>;
 
@@ -557,7 +558,7 @@ async fn ax_get_file(
     //let file: tokio::fs::File;
     let metadata = tokio::fs::metadata(&cached_file).await.unwrap();
     let mut headers = HeaderMap::new();
-    if let Some(content_type) = upstream_headers.get("Content-Type") {
+    if let Some(content_type) = upstream_headers.get(CONTENT_TYPE) {
         println!("Stored content-Type: {:?}", content_type);
         headers.insert(header::CONTENT_TYPE, content_type.clone());
     } else {
@@ -576,7 +577,7 @@ async fn ax_get_file(
 
     headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
     // add e-tag header from received_file.headers
-    if let Some(etag) = upstream_headers.get("ETag") {
+    if let Some(etag) = upstream_headers.get(ETAG) {
         headers.insert(header::ETAG, etag.clone());
     }
     // add last-modified header
