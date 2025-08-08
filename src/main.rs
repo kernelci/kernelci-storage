@@ -64,6 +64,9 @@ struct Args {
     generate_jwt_token: String,
 }
 
+// const names for last-modified and etag in lowercase
+const LAST_MODIFIED: &str = "last-modified";
+const ETAG: &str = "etag";
 
 type FileSemaphores = Arc<RwLock<HashMap<String, Arc<Semaphore>>>>;
 
@@ -539,6 +542,7 @@ async fn ax_get_file(
         }
     };
 
+    // IMPORTANT! Headers in cache must be stored in lowercase
     let received_file = driver_get_file(filepath.clone());
     if !received_file.valid {
         println!(
@@ -576,7 +580,7 @@ async fn ax_get_file(
         headers.insert(header::ETAG, etag.clone());
     }
     // add last-modified header
-    if let Some(last_modified) = upstream_headers.get("Last-Modified") {
+    if let Some(last_modified) = upstream_headers.get(LAST_MODIFIED) {
         headers.insert(header::LAST_MODIFIED, last_modified.clone());
     }
 
@@ -587,7 +591,7 @@ async fn ax_get_file(
         if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
             return (StatusCode::PRECONDITION_FAILED, "Method Not Allowed").into_response();
         }
-        if let Some(etag) = upstream_headers.get("ETag") {
+        if let Some(etag) = upstream_headers.get(ETAG) {
             if if_none_match == etag {
                 println!(
                     "{:?} 304 0 {} {} {} {}",
@@ -598,7 +602,7 @@ async fn ax_get_file(
         }
     // Does request have If-Modified-Since header?
     } else if let Some(if_modified_since) = rxheaders.get("If-Modified-Since") {
-        if let Some(last_modified) = upstream_headers.get("Last-Modified") {
+        if let Some(last_modified) = upstream_headers.get(LAST_MODIFIED) {
             // TODO: Validate properly last_modified
             if if_modified_since == last_modified {
                 println!(
