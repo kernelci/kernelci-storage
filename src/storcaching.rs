@@ -1,6 +1,15 @@
 use std::fs;
 use std::time::SystemTime;
 use tokio::time::Duration;
+use std::env;
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if env::var("STORAGE_DEBUG").is_ok() {
+            println!($($arg)*);
+        }
+    };
+}
 
 struct Files {
     file: String,
@@ -26,7 +35,7 @@ async fn read_filesinfo(cache_dir: String) -> Vec<Files> {
             files
         }
         Err(_) => {
-            println!("Error reading files");
+            eprintln!("Error reading cache directory files");
             Vec::new()
         }
     }
@@ -38,14 +47,14 @@ async fn freediskspace_percent(cache_dir: String) -> u64 {
     let total = match total_r {
         Ok(total) => total as f64,
         Err(_) => {
-            println!("Error getting total space");
+            eprintln!("Error getting disk total space");
             return 0;
         }
     };
     let free = match free_r {
         Ok(free) => free as f64,
         Err(_) => {
-            println!("Error getting free space");
+            eprintln!("Error getting disk free space");
             return 0;
         }
     };
@@ -58,22 +67,19 @@ fn delete_cache_file(file: String) {
     // Truncate from filename .content, and add .headers, delete both files
     let content_filename = file.clone();
     let headers_filename = file.replace(".content", ".headers");
-    println!(
-        "Deleting files: {} {}",
-        &content_filename, &headers_filename
-    );
+    debug_log!("Deleting files: {} {}", &content_filename, &headers_filename);
     let res = fs::remove_file(&content_filename);
     match res {
         Ok(_) => {}
         Err(_) => {
-            println!("Error deleting file: {}", content_filename);
+            debug_log!("Error deleting file: {}", content_filename);
         }
     }
     let res = fs::remove_file(&headers_filename);
     match res {
         Ok(_) => {}
         Err(_) => {
-            println!("Error deleting file: {}", headers_filename);
+            debug_log!("Error deleting file: {}", headers_filename);
         }
     }
 }
@@ -93,7 +99,7 @@ async fn clean_disk(cache_dir: String) {
     if oldest_file.last_update.elapsed().unwrap() > Duration::from_secs(60 * 60) {
         delete_cache_file(oldest_file.file);
     } else {
-        println!("File is less than 60 min old, skipping: {}, sleeping 60 seconds", oldest_file.file);
+        debug_log!("File is less than 60 min old, skipping: {}, sleeping 60 seconds", oldest_file.file);
         // sleep 60 seconds
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
@@ -119,7 +125,7 @@ pub async fn cache_loop(cache_dir: &str) {
             // critical mode, sleep only 100ms
             tokio::time::sleep(Duration::from_millis(100)).await;
         } else {
-            println!("Free disk space: {}%", free_space);
+            debug_log!("Free disk space: {}%", free_space);
             // normal mode, sleep 10 seconds
             tokio::time::sleep(Duration::from_secs(10)).await;
         }

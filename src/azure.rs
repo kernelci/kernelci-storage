@@ -23,6 +23,15 @@ use serde::Deserialize;
 use std::fs::read_to_string;
 use std::fs::File;
 use std::io::Read;
+use std::env;
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if env::var("STORAGE_DEBUG").is_ok() {
+            println!($($arg)*);
+        }
+    };
+}
 use std::io::Write;
 use std::sync::Arc;
 use tempfile::Builder;
@@ -250,7 +259,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             return received_file;
         } else {
             // delete cache file and headers
-            println!("Cache file {} is zero length, deleting", cache_filename);
+            debug_log!("Cache file {} is zero length, deleting", cache_filename);
             match std::fs::remove_file(&cache_filename) {
                 Ok(_) => {}
                 Err(e) => {
@@ -273,17 +282,12 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             }
         }
     }
-    /*
-    println!(
-        "Downloading blob to cache file {} from {}",
-        cache_filename, blob_url
-    );
-    */
+    debug_log!("Downloading blob to cache file {} from {}", cache_filename, blob_url);
     let client = Client::new();
     let response = client.get(blob_url).send().await;
     match response {
         Ok(response) => {
-            println!("Response: {:?}", response);
+            debug_log!("Azure response: {:?}", response);
             // is status anything else than 200?
             // TODO: Do we need to return headers as well or it is data leakage?
             if response.status() != 200 {
@@ -359,7 +363,7 @@ async fn azure_list_files(directory: String) -> Vec<String> {
             };
             listing.push(blob_name.clone());
         }
-        println!("Listing count: {}", listing.len());
+        debug_log!("Listing count: {}", listing.len());
     }
     //println!("Listing: {:?}", listing);
     listing

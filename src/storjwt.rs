@@ -4,6 +4,15 @@ use jwt::{Header, SignWithKey, Token, VerifyWithKey};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use toml::value::Table;
+use std::env;
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if env::var("STORAGE_DEBUG").is_ok() {
+            println!($($arg)*);
+        }
+    };
+}
 pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt::Error> {
     // config.toml, jwt_secret parameter
     let toml_cfg = get_config_content();
@@ -14,7 +23,7 @@ pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt
     let token: Token<Header, BTreeMap<String, String>, _> = match verify_result {
         Ok(token) => token,
         Err(e) => {
-            println!("verify_result Error: {:?} token_str: {}", e, token_str);
+            eprintln!("JWT verification error: {:?}", e);
             return Err(e);
         }
     };
@@ -23,10 +32,10 @@ pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt
     let email = claims.get("email");
     match email {
         Some(email) => {
-            println!("email: {}", email);
+            debug_log!("email: {}", email);
         }
         None => {
-            println!("email not found");
+            debug_log!("email not found");
             return Err(jwt::Error::InvalidSignature);
         }
     }
@@ -42,7 +51,7 @@ pub fn generate_jwt_secret() {
         .take(32)
         .map(char::from)
         .collect();
-    println!("jwt_secret=\"{}\"", secret);
+    debug_log!("jwt_secret=\"{}\"", secret);
 }
 
 pub fn generate_jwt_token(email: &str) -> Result<String, jwt::Error> {
