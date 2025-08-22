@@ -1,0 +1,5 @@
+driver="local"
+jwt_secret="test-secret-for-local-storage-testing"
+
+[local]
+storage_path="./test-storage"
