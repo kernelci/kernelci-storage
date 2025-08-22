@@ -11,6 +11,7 @@
 */
 
 mod azure;
+mod local;
 mod storcaching;
 mod storjwt;
 
@@ -116,9 +117,10 @@ trait Driver {
 fn init_driver(driver_type: &str) -> Box<dyn Driver> {
     let driver: Box<dyn Driver> = match driver_type {
         "azure" => Box::new(azure::AzureDriver::new()),
+        "local" => Box::new(local::LocalDriver::new()),
         //"google" => Box::new(google::GoogleDriver::new()),
         _ => {
-            eprintln!("Unknown driver type");
+            eprintln!("Unknown driver type: {}", driver_type);
             std::process::exit(1);
         }
     };
@@ -133,6 +135,17 @@ pub fn get_config_content() -> String {
     }
     
     std::fs::read_to_string(&cfg_file).unwrap()
+}
+
+/// Get driver type from config.toml, defaults to "azure" for backward compatibility
+fn get_driver_type() -> String {
+    let cfg_content = get_config_content();
+    let cfg: Table = toml::from_str(&cfg_content).unwrap();
+    
+    cfg.get("driver")
+        .and_then(|v| v.as_str())
+        .unwrap_or("azure")
+        .to_string()
 }
 
 /// Initial variables configuration and checks
@@ -693,14 +706,14 @@ async fn ax_get_file(
 }
 
 fn driver_get_file(filepath: String) -> ReceivedFile {
-    let driver_name = "azure";
-    let driver = init_driver(driver_name);
+    let driver_name = get_driver_type();
+    let driver = init_driver(&driver_name);
     driver.get_file(filepath)
 }
 
 fn write_file_driver(filename: String, data: Vec<u8>, cont_type: String) -> String {
-    let driver_name = "azure";
-    let driver = init_driver(driver_name);
+    let driver_name = get_driver_type();
+    let driver = init_driver(&driver_name);
     driver.write_file(filename, data, cont_type);
     "".to_string()
 }
@@ -759,8 +772,8 @@ fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
 }
 
 async fn ax_list_files() -> (StatusCode, String) {
-    let driver_name = "azure";
-    let driver = init_driver(driver_name);
+    let driver_name = get_driver_type();
+    let driver = init_driver(&driver_name);
     let files = driver.list_files("/".to_string());
     // generate nice list of files, with one file per line
     let files_str = files.join("\n");
