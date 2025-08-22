@@ -26,8 +26,16 @@ use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use headers::HeaderMap;
 use std::path;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf};
 use tokio::io::AsyncSeekExt;
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if env::var("STORAGE_DEBUG").is_ok() {
+            println!($($arg)*);
+        }
+    };
+}
 use tokio_util::io::ReaderStream;
 use toml::Table;
 use tower::ServiceBuilder;
@@ -390,7 +398,6 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
     if let Some(expect) = headers.get("Expect") {
         println!("Expect: {:?}", expect);
         if expect == "100-continue" {
-            println!("Expect 100-continue");
             return (StatusCode::CONTINUE, Vec::new());
         }
     }
@@ -418,10 +425,9 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
 
         match data {
             Ok(data) => {
-                println!("Length of `{}` is {} bytes", name, data.len());
+                println!("Field {}: {} bytes", name, data.len());
                 if name == "path" {
                     path = String::from_utf8(data.to_vec()).unwrap();
-                    println!("Path: {}", path);
                 } else if name == "file0" {
                     file0 = data.to_vec();
                     match filename {
@@ -429,7 +435,7 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
                         None => todo!(),
                     }
                 } else {
-                    println!("Unknown field: {} len: {}", name, data.len());
+                    println!("Unknown field {}: {} bytes", name, data.len());
                 }
             }
             Err(e) => {
@@ -441,12 +447,7 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
             }
         }
     }
-    println!(
-        "File: {} bytes filename: {} path: {}",
-        file0.len(),
-        file0_filename,
-        path
-    );
+    println!("Upload: {} bytes, {}/{}", file0.len(), path, file0_filename);
     // if path ends on /, remove it
     if path.ends_with("/") {
         // TBD: Fix it!
@@ -468,15 +469,11 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
 
     let content_type: String = match hdr_content_type {
         Some(content_type) => {
-            println!("Content-Type: {:?}", content_type);
             content_type.to_str().unwrap().to_string()
         }
         None => {
             let heuristic_ctype = heuristic_filetype(file0_filename);
-            println!(
-                "Content-Type not found, using heuristics: {}",
-                heuristic_ctype
-            );
+            debug_log!("Content-Type not found, using heuristics: {}", heuristic_ctype);
             heuristic_ctype
         }
     };
@@ -559,7 +556,6 @@ async fn ax_get_file(
     let metadata = tokio::fs::metadata(&cached_file).await.unwrap();
     let mut headers = HeaderMap::new();
     if let Some(content_type) = upstream_headers.get(CONTENT_TYPE) {
-        println!("Stored content-Type: {:?}", content_type);
         headers.insert(header::CONTENT_TYPE, content_type.clone());
     } else {
         headers.insert(
@@ -631,12 +627,10 @@ async fn ax_get_file(
             let mut end = metadata.len();
             // is Content-Range present?
             if let Some(range) = rxheaders.get("Range") {
-                println!("Range: {:?}", range);
                 (start, end) = parse_range(range.to_str().unwrap());
             }
             // if start is set to non-zero, we need to seek
             if start != 0 && (end == metadata.len() || end == 0) {
-                println!("Seeking to {}", start);
                 file.seek(std::io::SeekFrom::Start(start)).await.unwrap();
                 headers.insert(
                     header::CONTENT_RANGE,
@@ -688,7 +682,7 @@ async fn ax_get_file(
             return (StatusCode::OK, headers, axbody).into_response();
         }
         Err(_) => {
-            println!("Error opening file in ax_get_file");
+            eprintln!("Error opening file in ax_get_file");
             println!(
                 "{:?} 404 0 {} {} {} {}",
                 remote_addr, human_time, method, filepath, user_agent_str
@@ -739,7 +733,7 @@ fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
         let bmap = match verif_result {
             Ok(bmap) => bmap.clone(),
             Err(_) => {
-                println!("Error verifying token");
+                eprintln!("Error verifying token");
                 return Err(None);
             }
         };
@@ -753,7 +747,7 @@ fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
     let bmap = match verif_result {
         Ok(bmap) => bmap.clone(),
         Err(_) => {
-            println!("Error verifying bearer token");
+            eprintln!("Error verifying bearer token");
             return Err(None);
         }
     };
