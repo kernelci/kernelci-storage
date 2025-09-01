@@ -1,7 +1,7 @@
 # KernelCI Storage Server
 
 This is a simple storage server that supports file upload and download, with token based authentication.
-It supports multiple backends, currently only Azure Blob is supported, to provide user transparent storage.
+It supports multiple backends: Azure Blob Storage and local filesystem, to provide user transparent storage.
 It caches the files in a local directory and serves them from there.
 Range requests are supported, but only for start offset, end limit is not implemented yet.
 Files are protected by upload locking to prevent concurrent uploads to the same path.
@@ -10,13 +10,30 @@ Files are protected by upload locking to prevent concurrent uploads to the same 
 
 The server is configured using toml configuration file, the default configuration file is `config.toml`.
 
+### Azure Backend Configuration
+
 ```toml
+driver="azure"  # Optional, defaults to "azure"
 jwt_secret="JWT_SECRET"
 [azure]
 account=""
 key=""
 container=""
 sastoken=""
+
+# User upload permissions (optional)
+[[users]]
+name = "user@email.com"
+prefixes = ["/allowed/path"]
+```
+
+### Local Filesystem Backend Configuration
+
+```toml
+driver="local"
+jwt_secret="JWT_SECRET"
+[local]
+storage_path="./storage"  # Optional, defaults to "./storage"
 
 # User upload permissions (optional)
 [[users]]
