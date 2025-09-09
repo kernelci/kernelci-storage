@@ -1,8 +1,25 @@
+permissions:
+  contents: read
+  packages: write
+
 on:
   release:
     types: [created]
   workflow_dispatch:
-  
+    inputs:
+      environment:
+        description: 'Select the environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+      branch:
+        description: 'Select the branch'
+        required: true
+        default: 'main'
+
 name: Build docker image
 jobs:
   build:
@@ -10,14 +27,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch }}
+      - name: Retrieve github username
+        run: echo "${{ github.actor }}" > github_username.txt
+      - name: Set name of docker image on staging
+        if: ${{ github.event.inputs.environment == 'staging' }}
+        run: echo "ghcr.io/${{ github.actor }}/kernelci-storage:staging" > image_name.txt
+      - name: Set name of docker image on production
+        if: ${{ github.event.inputs.environment == 'production' }}
+        run: echo "ghcr.io/${{ github.actor }}/kernelci-storage:latest" > image_name.txt
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
       - name: Build and push
-# running ARM64 will take a long time (1hr+), so we only build for AMD64 for now
-#        run: |
-#         docker buildx build --platform linux/amd64,linux/arm64 -t ghcr.io/nuclearcat/kernelci-storage:latest --push .
         run: |
-         docker buildx build --platform linux/amd64 -t ghcr.io/kernelci/kernelci-storage:latest --push .
+         docker buildx build --platform linux/amd64 -t $(cat image_name.txt) --push .
 
