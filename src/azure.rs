@@ -45,6 +45,21 @@ struct AzureConfig {
     sastoken: String,
 }
 
+// Sanitize Azure Blob Index tag key/value components.
+// Replace any non [A-Za-z0-9_.-] characters with '_'.
+fn sanitize_tag_component(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Get Azure credentials from config.toml
 fn get_azure_credentials(name: &str) -> AzureConfig {
     let cfg_content = get_config_content();
@@ -149,7 +164,16 @@ async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String, 
             // Set owner tag if email is provided
             if let Some(email) = owner_email {
                 let mut tags = Tags::new();
-                tags.insert("owner".to_string(), email);
+                let sanitized = sanitize_tag_component(&email);
+                if sanitized != email {
+                    debug_log!(
+                        "Sanitized owner tag value from '{}' to '{}'",
+                        email, sanitized
+                    );
+                }
+                // Ensure non-empty value
+                let final_value = if sanitized.is_empty() { "_".to_string() } else { sanitized };
+                tags.insert("owner".to_string(), final_value);
                 match blob_client.set_tags(tags).await {
                     Ok(_) => {
                         debug_log!("Owner tag set successfully");
@@ -341,10 +365,25 @@ async fn azure_set_filename_tags(
     let blob_client = ClientBuilder::new(storage_account, storage_credential)
         .blob_client(storage_container, storage_blob);
     let mut tags = Tags::new();
-    // iterate and add tags, tags are in format "
-    for tag in user_tags {
-        let (tag, value) = tag;
-        tags.insert(tag, value);
+    // Iterate and add tags after sanitizing key and value
+    for (key, value) in user_tags {
+        let sanitized_key = sanitize_tag_component(&key);
+        let sanitized_value = sanitize_tag_component(&value);
+        if sanitized_key != key || sanitized_value != value {
+            debug_log!(
+                "Sanitized tag '{}'='{}' -> '{}'='{}'",
+                key,
+                value,
+                sanitized_key,
+                sanitized_value
+            );
+        }
+        if sanitized_key.is_empty() {
+            debug_log!("Skipping tag with empty key after sanitization: '{}'", key);
+            continue;
+        }
+        let final_value = if sanitized_value.is_empty() { "_".to_string() } else { sanitized_value };
+        tags.insert(sanitized_key, final_value);
     }
     let res = blob_client.set_tags(tags).await;
     match res {
