@@ -101,7 +101,7 @@ fn calculate_checksum(filename: &str, data: &[u8]) {
 }
 
 /// Write file to local storage
-fn write_file_to_local(filename: String, data: Vec<u8>, cont_type: String) -> Result<String, String> {
+fn write_file_to_local(filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> Result<String, String> {
     let file_path = get_storage_file_path(&filename);
     
     // Ensure directory structure exists
@@ -122,11 +122,14 @@ fn write_file_to_local(filename: String, data: Vec<u8>, cont_type: String) -> Re
         }
     }
     
-    // Create and write metadata (headers)
+    // Create and write metadata (headers and owner tag)
     let metadata_path = get_metadata_file_path(&filename);
     if let Ok(mut metadata_file) = File::create(&metadata_path) {
-        let headers_content = format!("content-type:{}\n", cont_type);
-        let _ = metadata_file.write_all(headers_content.as_bytes());
+        let mut metadata_content = format!("content-type:{}\n", cont_type);
+        if let Some(email) = owner_email {
+            metadata_content.push_str(&format!("tag-owner:{}\n", email));
+        }
+        let _ = metadata_file.write_all(metadata_content.as_bytes());
     }
     
     debug_log!("File written to local storage: {}", file_path.display());
@@ -266,8 +269,8 @@ fn set_tags_for_local_file(filename: String, user_tags: Vec<(String, String)>) -
 
 /// Implement Driver trait for LocalDriver
 impl super::Driver for LocalDriver {
-    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String) -> String {
-        match write_file_to_local(filename.clone(), data, cont_type) {
+    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String {
+        match write_file_to_local(filename.clone(), data, cont_type, owner_email) {
             Ok(_) => filename,
             Err(e) => {
                 eprintln!("Local storage write error: {}", e);

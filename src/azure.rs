@@ -71,7 +71,7 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
 
 /// Write file to Azure blob storage
 /// TBD: Rework, do not keep whole file as Vec<u8> in memory!!!
-async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String) -> &'static str {
+async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> &'static str {
     let azure_cfg = Arc::new(get_azure_credentials("azure"));
 
     let storage_account = azure_cfg.account.as_str();
@@ -143,6 +143,20 @@ async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String) 
                 }
                 Err(e) => {
                     eprintln!("Error getting blob URL: {:?}", e);
+                }
+            }
+            
+            // Set owner tag if email is provided
+            if let Some(email) = owner_email {
+                let mut tags = Tags::new();
+                tags.insert("owner".to_string(), email);
+                match blob_client.set_tags(tags).await {
+                    Ok(_) => {
+                        debug_log!("Owner tag set successfully");
+                    }
+                    Err(e) => {
+                        eprintln!("Error setting owner tag: {:?}", e);
+                    }
                 }
             }
         }
@@ -371,12 +385,12 @@ async fn azure_list_files(directory: String) -> Vec<String> {
 
 /// Implement Driver trait for AzureDriver
 impl super::Driver for AzureDriver {
-    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String) -> String {
+    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String {
         let filenameret = filename.clone();
         /* Call async write_file_to_blob use tokio::task::block_in_place */
         tokio::task::block_in_place(|| {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(write_file_to_blob(filename, data, cont_type));
+            rt.block_on(write_file_to_blob(filename, data, cont_type, owner_email));
         });
         filenameret
     }
