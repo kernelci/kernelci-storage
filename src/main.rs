@@ -104,7 +104,7 @@ struct ReceivedFile {
 }
 
 trait Driver {
-    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String) -> String;
+    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String;
     fn get_file(&self, filename: String) -> ReceivedFile;
     fn tag_file(
         &self,
@@ -492,7 +492,7 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
     };
 
     // TBD
-    let message = write_file_driver(full_path, file0, content_type.to_string());
+    let message = write_file_driver(full_path, file0, content_type.to_string(), Some(owner));
     if !message.is_empty() {
         return (StatusCode::CONFLICT, Vec::new());
     }
@@ -711,10 +711,10 @@ fn driver_get_file(filepath: String) -> ReceivedFile {
     driver.get_file(filepath)
 }
 
-fn write_file_driver(filename: String, data: Vec<u8>, cont_type: String) -> String {
+fn write_file_driver(filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String {
     let driver_name = get_driver_type();
     let driver = init_driver(&driver_name);
-    driver.write_file(filename, data, cont_type);
+    driver.write_file(filename, data, cont_type, owner_email);
     "".to_string()
 }
 

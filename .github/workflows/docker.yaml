@@ -34,10 +34,10 @@ jobs:
         run: echo "${{ github.actor }}" > github_username.txt
       - name: Set name of docker image on staging
         if: ${{ github.event.inputs.environment == 'staging' }}
-        run: echo "ghcr.io/${{ github.actor }}/kernelci-storage:staging" > image_name.txt
+        run: echo "ghcr.io/${{ github.repository_owner }}/kernelci-storage:staging" > image_name.txt
       - name: Set name of docker image on production
         if: ${{ github.event.inputs.environment == 'production' }}
-        run: echo "ghcr.io/${{ github.actor }}/kernelci-storage:latest" > image_name.txt
+        run: echo "ghcr.io/${{ github.repository_owner }}/kernelci-storage:latest" > image_name.txt
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to ghcr.io
