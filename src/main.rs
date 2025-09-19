@@ -19,7 +19,7 @@ mod storjwt;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, OriginalUri, Path, State},
     http::{header, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -153,6 +153,40 @@ fn get_driver_type() -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("azure")
         .to_string()
+}
+
+fn client_ip_from_headers(headers: &HeaderMap, fallback: SocketAddr) -> String {
+    if let Some(forwarded_for) = headers
+        .get("X-Forwarded-For")
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(first_ip) = forwarded_for
+            .split(',')
+            .map(|part| part.trim())
+            .find(|part| !part.is_empty())
+        {
+            return first_ip.to_string();
+        }
+    }
+
+    if let Some(forwarded) = headers
+        .get("Forwarded")
+        .and_then(|value| value.to_str().ok())
+    {
+        for entry in forwarded.split(',') {
+            for directive in entry.split(';') {
+                let directive = directive.trim();
+                if let Some(value) = directive.strip_prefix("for=") {
+                    let cleaned = value.trim_matches('"');
+                    if !cleaned.is_empty() {
+                        return cleaned.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    fallback.ip().to_string()
 }
 
 /// Initial variables configuration and checks
@@ -412,6 +446,8 @@ fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
     If the token is correct, it will write the content of the file to the server
 */
 async fn ax_post_file(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    OriginalUri(original_uri): OriginalUri,
     headers: HeaderMap,
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -512,14 +548,36 @@ async fn ax_post_file(
     };
 
     // TBD
-    let message = write_file_driver(full_path, file0, content_type.to_string(), Some(owner));
+    let upload_size = file0.len();
+    let message = write_file_driver(
+        full_path.clone(),
+        file0,
+        content_type.to_string(),
+        Some(owner.clone()),
+    );
     if !message.is_empty() {
         return (StatusCode::CONFLICT, Vec::new());
     }
+    let status = StatusCode::OK;
+    let client_ip = client_ip_from_headers(&headers, remote_addr);
+    let timestamp = std::time::SystemTime::now();
+    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
+    let request_target = original_uri.to_string();
+    println!(
+        "{} {} {} {} {} {} {} {}",
+        client_ip,
+        status.as_u16(),
+        upload_size,
+        human_time,
+        Method::POST,
+        request_target,
+        full_path,
+        owner
+    );
     // write metadata file into cache directory
     //let metadata_filename = format!("{}/{}.metadata", path, file0_filename);
     //write_cache_metadata(metadata_filename, file0.len());
-    (StatusCode::OK, Vec::new())
+    (status, Vec::new())
 }
 
 fn filename_from_fullpath(filepath: &str) -> String {
