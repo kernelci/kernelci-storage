@@ -10,7 +10,7 @@ impl AzureDriver {
     }
 }
 
-use crate::{get_config_content, ReceivedFile};
+use crate::{debug_log, get_config_content, ReceivedFile};
 use axum::http::{HeaderName, HeaderValue};
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::container::operations::BlobItem;
@@ -23,15 +23,6 @@ use serde::Deserialize;
 use std::fs::read_to_string;
 use std::fs::File;
 use std::io::Read;
-use std::env;
-
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if env::var("STORAGE_DEBUG").is_ok() {
-            println!($($arg)*);
-        }
-    };
-}
 use std::io::Write;
 use std::sync::Arc;
 use tempfile::Builder;
@@ -81,12 +72,17 @@ fn get_azure_credentials(name: &str) -> AzureConfig {
 fn calculate_checksum(filename: &String, data: &[u8]) {
     let hash = sha2_512::default().update(data).finalize();
     let digest = hash.digest();
-    println!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
+    debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
 /// Write file to Azure blob storage
 /// TBD: Rework, do not keep whole file as Vec<u8> in memory!!!
-async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> &'static str {
+async fn write_file_to_blob(
+    filename: String,
+    data: Vec<u8>,
+    cont_type: String,
+    owner_email: Option<String>,
+) -> &'static str {
     let azure_cfg = Arc::new(get_azure_credentials("azure"));
 
     let storage_account = azure_cfg.account.as_str();
@@ -130,7 +126,7 @@ async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String, 
                 match blob_client.put_block(block_id, buffer).await {
                     Ok(_) => {
                         total_bytes_uploaded += bytes_read;
-                        println!("Uploaded {} bytes", total_bytes_uploaded);
+                        debug_log!("Uploaded {} bytes", total_bytes_uploaded);
                     }
                     Err(e) => {
                         eprintln!("Error uploading block: {:?}", e);
@@ -150,17 +146,17 @@ async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String, 
         .await
     {
         Ok(_) => {
-            println!("Block list uploaded");
+            debug_log!("Block list uploaded");
             let blob_url_res = blob_client.url();
             match blob_url_res {
                 Ok(blob_url) => {
-                    println!("Blob URL: {}", blob_url);
+                    debug_log!("Blob URL: {}", blob_url);
                 }
                 Err(e) => {
                     eprintln!("Error getting blob URL: {:?}", e);
                 }
             }
-            
+
             // Set owner tag if email is provided
             if let Some(email) = owner_email {
                 let mut tags = Tags::new();
@@ -168,11 +164,16 @@ async fn write_file_to_blob(filename: String, data: Vec<u8>, cont_type: String, 
                 if sanitized != email {
                     debug_log!(
                         "Sanitized owner tag value from '{}' to '{}'",
-                        email, sanitized
+                        email,
+                        sanitized
                     );
                 }
                 // Ensure non-empty value
-                let final_value = if sanitized.is_empty() { "_".to_string() } else { sanitized };
+                let final_value = if sanitized.is_empty() {
+                    "_".to_string()
+                } else {
+                    sanitized
+                };
                 tags.insert("owner".to_string(), final_value);
                 match blob_client.set_tags(tags).await {
                     Ok(_) => {
@@ -275,9 +276,10 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(1000));
-            println!(
+            debug_log!(
                 "Waiting for headers file {} to exist: {} seconds",
-                cache_filename_headers, seconds
+                cache_filename_headers,
+                seconds
             );
         }
 
@@ -320,7 +322,11 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             }
         }
     }
-    debug_log!("Downloading blob to cache file {} from {}", cache_filename, blob_url);
+    debug_log!(
+        "Downloading blob to cache file {} from {}",
+        cache_filename,
+        blob_url
+    );
     let client = Client::new();
     let response = client.get(blob_url).send().await;
     match response {
@@ -382,17 +388,17 @@ async fn azure_set_filename_tags(
             debug_log!("Skipping tag with empty key after sanitization: '{}'", key);
             continue;
         }
-        let final_value = if sanitized_value.is_empty() { "_".to_string() } else { sanitized_value };
+        let final_value = if sanitized_value.is_empty() {
+            "_".to_string()
+        } else {
+            sanitized_value
+        };
         tags.insert(sanitized_key, final_value);
     }
     let res = blob_client.set_tags(tags).await;
     match res {
-        Ok(_) => {
-            Ok(String::from("OK"))
-        }
-        Err(e) => {
-            Err(e.to_string())
-        }
+        Ok(_) => Ok(String::from("OK")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
@@ -424,7 +430,13 @@ async fn azure_list_files(directory: String) -> Vec<String> {
 
 /// Implement Driver trait for AzureDriver
 impl super::Driver for AzureDriver {
-    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String {
+    fn write_file(
+        &self,
+        filename: String,
+        data: Vec<u8>,
+        cont_type: String,
+        owner_email: Option<String>,
+    ) -> String {
         let filenameret = filename.clone();
         /* Call async write_file_to_blob use tokio::task::block_in_place */
         tokio::task::block_in_place(|| {

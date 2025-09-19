@@ -1,15 +1,7 @@
+use crate::debug_log;
 use std::fs;
 use std::time::SystemTime;
 use tokio::time::Duration;
-use std::env;
-
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if env::var("STORAGE_DEBUG").is_ok() {
-            println!($($arg)*);
-        }
-    };
-}
 
 struct Files {
     file: String,
@@ -67,7 +59,11 @@ fn delete_cache_file(file: String) {
     // Truncate from filename .content, and add .headers, delete both files
     let content_filename = file.clone();
     let headers_filename = file.replace(".content", ".headers");
-    debug_log!("Deleting files: {} {}", &content_filename, &headers_filename);
+    debug_log!(
+        "Deleting files: {} {}",
+        &content_filename,
+        &headers_filename
+    );
     let res = fs::remove_file(&content_filename);
     match res {
         Ok(_) => {}
@@ -99,7 +95,10 @@ async fn clean_disk(cache_dir: String) {
     if oldest_file.last_update.elapsed().unwrap() > Duration::from_secs(60 * 60) {
         delete_cache_file(oldest_file.file);
     } else {
-        debug_log!("File is less than 60 min old, skipping: {}, sleeping 60 seconds", oldest_file.file);
+        debug_log!(
+            "File is less than 60 min old, skipping: {}, sleeping 60 seconds",
+            oldest_file.file
+        );
         // sleep 60 seconds
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
