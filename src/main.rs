@@ -497,7 +497,11 @@ async fn ax_post_file(
                     file0 = data.to_vec();
                     match filename {
                         Some(filename) => file0_filename = filename.to_string(),
-                        None => todo!(),
+                        None => {
+                            let error_msg = "No filename provided".to_string();
+                            eprintln!("{}", error_msg);
+                            return (StatusCode::BAD_REQUEST, error_msg.into_bytes());
+                        }
                     }
                 } else {
                     debug_log!("Unknown field {}: {} bytes", name, data.len());

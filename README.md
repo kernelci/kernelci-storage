@@ -86,6 +86,19 @@ curl -X GET https://localhost:3000/v1/checkauth \
 
 The server supports large file uploads up to 4GB and includes upload conflict protection to prevent concurrent uploads to the same file path. Downloads have a 30-second timeout for acquiring file locks.
 
+### Uploading Files with curl
+
+Use `curl`'s multipart form support to send the file contents (`file0`) and target path. The upload endpoint accepts both `/upload` and `/v1/file`.
+
+```bash
+curl -X POST http://localhost:3000/v1/file \
+    -H "Authorization: Bearer <JWT_TOKEN>" \
+    -F "path=artifacts/build-123" \
+    -F "file0=@/absolute/path/to/build-output.tar.xz"
+```
+
+The resulting object is stored under `artifacts/build-123/<local filename>`. Swap in `/upload` if you prefer the shorter alias or use the public host name instead of `localhost` when interacting with a remote server.
+
 ### Metrics
 
 The `/metrics` endpoint provides Prometheus-compatible metrics including:
