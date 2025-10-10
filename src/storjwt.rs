@@ -1,18 +1,9 @@
-use crate::get_config_content;
+use crate::{debug_log, get_config_content};
 use hmac::{Hmac, Mac};
 use jwt::{Header, SignWithKey, Token, VerifyWithKey};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use toml::value::Table;
-use std::env;
-
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if env::var("STORAGE_DEBUG").is_ok() {
-            println!($($arg)*);
-        }
-    };
-}
 pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt::Error> {
     // config.toml, jwt_secret parameter
     let toml_cfg = get_config_content();

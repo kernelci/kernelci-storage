@@ -12,12 +12,14 @@
 
 mod azure;
 mod local;
+#[macro_use]
+mod logging;
 mod storcaching;
 mod storjwt;
 
 use axum::{
     body::Body,
-    extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Multipart, OriginalUri, Path, State},
     http::{header, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -27,22 +29,16 @@ use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use headers::HeaderMap;
 use std::path;
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::sync::OnceLock;
+use std::{net::SocketAddr, path::PathBuf};
 use tokio::io::AsyncSeekExt;
 
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        if env::var("STORAGE_DEBUG").is_ok() {
-            println!($($arg)*);
-        }
-    };
-}
+use std::{collections::HashMap, sync::Arc};
+use sysinfo::Disks;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 use toml::Table;
 use tower::ServiceBuilder;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{RwLock, Semaphore};
-use sysinfo::Disks;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -71,6 +67,15 @@ struct Args {
 
     #[clap(long, default_value = "", help = "Generate JWT token for email")]
     generate_jwt_token: String,
+
+    #[clap(short, long, action = clap::ArgAction::SetTrue, help = "Enable verbose logging")]
+    verbose: bool,
+}
+
+static ARGS: OnceLock<Args> = OnceLock::new();
+
+fn get_args() -> &'static Args {
+    ARGS.get_or_init(|| Args::parse())
 }
 
 // const names for last-modified and etag in lowercase
@@ -85,11 +90,7 @@ struct AppState {
     file_locks: FileSemaphores,
 }
 
-
-async fn get_or_create_semaphore(
-    locks: &FileSemaphores,
-    filename: &str,
-) -> Arc<Semaphore> {
+async fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<Semaphore> {
     let mut map = locks.write().await;
     map.entry(filename.to_string())
         .or_insert_with(|| Arc::new(Semaphore::new(1)))
@@ -104,7 +105,13 @@ struct ReceivedFile {
 }
 
 trait Driver {
-    fn write_file(&self, filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String;
+    fn write_file(
+        &self,
+        filename: String,
+        data: Vec<u8>,
+        cont_type: String,
+        owner_email: Option<String>,
+    ) -> String;
     fn get_file(&self, filename: String) -> ReceivedFile;
     fn tag_file(
         &self,
@@ -128,12 +135,12 @@ fn init_driver(driver_type: &str) -> Box<dyn Driver> {
 }
 
 pub fn get_config_content() -> String {
-    let args = Args::parse();
+    let args = get_args();
     let mut cfg_file = PathBuf::from(&args.config_file);
     if let Ok(cfg_file_env) = std::env::var("KCI_STORAGE_CONFIG") {
         cfg_file = PathBuf::from(&cfg_file_env);
     }
-    
+
     std::fs::read_to_string(&cfg_file).unwrap()
 }
 
@@ -141,18 +148,52 @@ pub fn get_config_content() -> String {
 fn get_driver_type() -> String {
     let cfg_content = get_config_content();
     let cfg: Table = toml::from_str(&cfg_content).unwrap();
-    
+
     cfg.get("driver")
         .and_then(|v| v.as_str())
         .unwrap_or("azure")
         .to_string()
 }
 
+fn client_ip_from_headers(headers: &HeaderMap, fallback: SocketAddr) -> String {
+    if let Some(forwarded_for) = headers
+        .get("X-Forwarded-For")
+        .and_then(|value| value.to_str().ok())
+    {
+        if let Some(first_ip) = forwarded_for
+            .split(',')
+            .map(|part| part.trim())
+            .find(|part| !part.is_empty())
+        {
+            return first_ip.to_string();
+        }
+    }
+
+    if let Some(forwarded) = headers
+        .get("Forwarded")
+        .and_then(|value| value.to_str().ok())
+    {
+        for entry in forwarded.split(',') {
+            for directive in entry.split(';') {
+                let directive = directive.trim();
+                if let Some(value) = directive.strip_prefix("for=") {
+                    let cleaned = value.trim_matches('"');
+                    if !cleaned.is_empty() {
+                        return cleaned.to_string();
+                    }
+                }
+            }
+        }
+    }
+
+    fallback.ip().to_string()
+}
+
 /// Initial variables configuration and checks
 async fn initial_setup() -> Option<RustlsConfig> {
     let cache_dir = "cache";
     let download_dir = "download";
-    let args = Args::parse();
+    let args = get_args();
 
     if args.generate_jwt_secret {
         storjwt::generate_jwt_secret();
@@ -191,10 +232,10 @@ async fn initial_setup() -> Option<RustlsConfig> {
     // is ENV KCI_STORAGE_CONFIG set?
     if let Ok(cfg_file_env) = std::env::var("KCI_STORAGE_CONFIG") {
         cfg_file = PathBuf::from(&cfg_file_env);
-        println!("Using config file from ENV: {}", cfg_file.display());
+        debug_log!("Using config file from ENV: {}", cfg_file.display());
     } else {
         cfg_file = PathBuf::from(&args.config_file);
-        println!("Using config file from args: {}", cfg_file.display());
+        debug_log!("Using config file from args: {}", cfg_file.display());
     }
 
     if !cfg_file.exists() {
@@ -209,7 +250,7 @@ async fn initial_setup() -> Option<RustlsConfig> {
     .await;
     match config {
         Ok(tlsconf) => {
-            println!("TLS config loaded, HTTPS mode enabled");
+            debug_log!("TLS config loaded, HTTPS mode enabled");
             Some(tlsconf)
         }
         Err(e) => {
@@ -245,22 +286,29 @@ async fn ax_metrics() -> (StatusCode, String) {
         let tag_diskname = disk.name().to_string_lossy();
         let tag_total_space = disk.total_space();
         let tag_available_space = disk.available_space();
-        
-        metrics.push_str(&format!("storage_free_space {{hostname=\"{}\", diskname=\"{}\", mount_point=\"{}\"}} {}\n", hostname, tag_diskname, mount_point, tag_available_space));
-        metrics.push_str(&format!("storage_total_space {{hostname=\"{}\", diskname=\"{}\", mount_point=\"{}\"}} {}\n", hostname, tag_diskname, mount_point, tag_total_space));
+
+        metrics.push_str(&format!(
+            "storage_free_space {{hostname=\"{}\", diskname=\"{}\", mount_point=\"{}\"}} {}\n",
+            hostname, tag_diskname, mount_point, tag_available_space
+        ));
+        metrics.push_str(&format!(
+            "storage_total_space {{hostname=\"{}\", diskname=\"{}\", mount_point=\"{}\"}} {}\n",
+            hostname, tag_diskname, mount_point, tag_total_space
+        ));
     }
     (StatusCode::OK, metrics)
 }
 
 #[tokio::main]
 async fn main() {
+    logging::init(get_args().verbose);
     tracing_subscriber::fmt::init();
     let tlscfg = initial_setup().await;
     let port = 3000;
     let state = AppState {
         file_locks: Arc::new(RwLock::new(HashMap::new())),
     };
-    println!("Starting server, tls: {:?}", tlscfg);
+    debug_log!("Starting server, tls: {:?}", tlscfg);
 
     // Supported endpoints:
     // GET / - root
@@ -320,7 +368,7 @@ async fn ax_check_auth(headers: HeaderMap) -> (StatusCode, String) {
     match message {
         Ok(email) => {
             let message = format!("Authorized: {}", email);
-            println!("Authorized: {}", email);
+            debug_log!("Authorized: {}", email);
             (StatusCode::OK, message)
         }
         Err(_) => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
@@ -366,7 +414,7 @@ fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
     let users = match users_r {
         Some(users) => users,
         None => {
-            println!("No users section in config.toml, ignoring upload path restriction");
+            debug_log!("No users section in config.toml, ignoring upload path restriction");
             return Ok(());
         }
     };
@@ -397,14 +445,20 @@ fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
     This function will check if the Authorization header is present and if the token is correct
     If the token is correct, it will write the content of the file to the server
 */
-async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut multipart: Multipart) -> (StatusCode, Vec<u8>) {
+async fn ax_post_file(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> (StatusCode, Vec<u8>) {
     // call check_auth
     let message = verify_auth_hdr(&headers);
     let owner = match message {
         Ok(owner) => owner,
         Err(_) => return (StatusCode::UNAUTHORIZED, Vec::new()),
     };
-    println!("Authorized");
+    debug_log!("Authorized");
 
     /* 100-continue Expect is broken, quite hard to fix in axum */
     /*
@@ -416,11 +470,10 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
     }
     */
 
-    println!("Uploading file");
+    debug_log!("Uploading file");
     let mut path: String = "".to_string();
     let mut file0: Vec<u8> = Vec::new();
     let mut file0_filename: String = "".to_string();
-    
 
     // verify upload permissions, some users have upload permissions only for certain prefix(path)
     // check config.toml for upload_prefixes
@@ -428,7 +481,6 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
         Ok(_) => (),
         Err(e) => return (StatusCode::FORBIDDEN, e.to_string().into_bytes()),
     }
-
 
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
@@ -438,7 +490,7 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
 
         match data {
             Ok(data) => {
-                println!("Field {}: {} bytes", name, data.len());
+                debug_log!("Field {}: {} bytes", name, data.len());
                 if name == "path" {
                     path = String::from_utf8(data.to_vec()).unwrap();
                 } else if name == "file0" {
@@ -448,7 +500,7 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
                         None => todo!(),
                     }
                 } else {
-                    println!("Unknown field {}: {} bytes", name, data.len());
+                    debug_log!("Unknown field {}: {} bytes", name, data.len());
                 }
             }
             Err(e) => {
@@ -460,46 +512,72 @@ async fn ax_post_file(headers: HeaderMap, State(state): State<AppState>, mut mul
             }
         }
     }
-    println!("Upload: {} bytes, {}/{}", file0.len(), path, file0_filename);
+    debug_log!("Upload: {} bytes, {}/{}", file0.len(), path, file0_filename);
     // if path ends on /, remove it
     if path.ends_with("/") {
         // TBD: Fix it!
-        println!("Removing trailing /, workaround");
+        debug_log!("Removing trailing /, workaround");
         path.pop();
     }
-    
+
     let full_path = format!("{}/{}", path, file0_filename);
     let hdr_content_type = headers.get("Content-Type-Upstream");
     let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
-    
+
     // Try to acquire permit - fails immediately if upload in progress
-    let permit = match semaphore.try_acquire() {
+    let _permit = match semaphore.try_acquire() {
         Ok(permit) => permit,
         Err(_) => {
-            return (StatusCode::CONFLICT, "Upload already in progress".to_string().into_bytes());
+            return (
+                StatusCode::CONFLICT,
+                "Upload already in progress".to_string().into_bytes(),
+            );
         }
     };
 
     let content_type: String = match hdr_content_type {
-        Some(content_type) => {
-            content_type.to_str().unwrap().to_string()
-        }
+        Some(content_type) => content_type.to_str().unwrap().to_string(),
         None => {
             let heuristic_ctype = heuristic_filetype(file0_filename);
-            debug_log!("Content-Type not found, using heuristics: {}", heuristic_ctype);
+            debug_log!(
+                "Content-Type not found, using heuristics: {}",
+                heuristic_ctype
+            );
             heuristic_ctype
         }
     };
 
     // TBD
-    let message = write_file_driver(full_path, file0, content_type.to_string(), Some(owner));
+    let upload_size = file0.len();
+    let message = write_file_driver(
+        full_path.clone(),
+        file0,
+        content_type.to_string(),
+        Some(owner.clone()),
+    );
     if !message.is_empty() {
         return (StatusCode::CONFLICT, Vec::new());
     }
+    let status = StatusCode::OK;
+    let client_ip = client_ip_from_headers(&headers, remote_addr);
+    let timestamp = std::time::SystemTime::now();
+    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
+    let request_target = original_uri.to_string();
+    println!(
+        "{} {} {} {} {} {} {} {}",
+        client_ip,
+        status.as_u16(),
+        upload_size,
+        human_time,
+        Method::POST,
+        request_target,
+        full_path,
+        owner
+    );
     // write metadata file into cache directory
     //let metadata_filename = format!("{}/{}.metadata", path, file0_filename);
     //write_cache_metadata(metadata_filename, file0.len());
-    (StatusCode::OK, Vec::new())
+    (status, Vec::new())
 }
 
 fn filename_from_fullpath(filepath: &str) -> String {
@@ -540,18 +618,17 @@ async fn ax_get_file(
 
     let semaphore = get_or_create_semaphore(&state.file_locks, &filepath).await;
     // Wait for permit with timeout
-    let _permit = match tokio::time::timeout(
-        tokio::time::Duration::from_secs(30),
-        semaphore.acquire(),
-    ).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Semaphore closed").into_response();
-        }
-        Err(_) => {
-            return (StatusCode::REQUEST_TIMEOUT, "Timeout waiting for upload").into_response();
-        }
-    };
+    let _permit =
+        match tokio::time::timeout(tokio::time::Duration::from_secs(30), semaphore.acquire()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Semaphore closed").into_response();
+            }
+            Err(_) => {
+                return (StatusCode::REQUEST_TIMEOUT, "Timeout waiting for upload").into_response();
+            }
+        };
 
     // IMPORTANT! Headers in cache must be stored in lowercase
     let received_file = driver_get_file(filepath.clone());
@@ -711,7 +788,12 @@ fn driver_get_file(filepath: String) -> ReceivedFile {
     driver.get_file(filepath)
 }
 
-fn write_file_driver(filename: String, data: Vec<u8>, cont_type: String, owner_email: Option<String>) -> String {
+fn write_file_driver(
+    filename: String,
+    data: Vec<u8>,
+    cont_type: String,
+    owner_email: Option<String>,
+) -> String {
     let driver_name = get_driver_type();
     let driver = init_driver(&driver_name);
     driver.write_file(filename, data, cont_type, owner_email);
@@ -738,7 +820,9 @@ fn parse_range(range: &str) -> (u64, u64) {
 /// Return error message + owner if the token is correct
 fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
     let auth = headers.get("Authorization");
-    if auth == None { return Err(None) }
+    if auth == None {
+        return Err(None);
+    }
     let token = auth.unwrap().to_str().unwrap().split_whitespace();
     let token_parts: Vec<&str> = token.collect();
     if token_parts.len() != 2 {
