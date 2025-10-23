@@ -25,6 +25,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use bytes::Bytes;
+use async_trait::async_trait;
 use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use headers::HeaderMap;
@@ -34,11 +36,14 @@ use std::{net::SocketAddr, path::PathBuf};
 use tokio::io::AsyncSeekExt;
 
 use std::{collections::HashMap, sync::Arc};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use sysinfo::Disks;
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 use toml::Table;
 use tower::ServiceBuilder;
+use futures::Future;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -104,11 +109,89 @@ struct ReceivedFile {
     valid: bool,
 }
 
-trait Driver {
+// Wrapper to convert Multipart Field into AsyncRead
+struct FieldStream<'a> {
+    field: axum::extract::multipart::Field<'a>,
+    buffer: Option<Bytes>,
+    offset: usize,
+}
+
+impl<'a> FieldStream<'a> {
+    fn new(field: axum::extract::multipart::Field<'a>) -> Self {
+        FieldStream {
+            field,
+            buffer: None,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> tokio::io::AsyncRead for FieldStream<'a> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // If we have buffered data, copy it first
+        if let Some(buffer) = &this.buffer {
+            if this.offset < buffer.len() {
+                let remaining = &buffer[this.offset..];
+                let to_copy = std::cmp::min(remaining.len(), buf.remaining());
+                buf.put_slice(&remaining[..to_copy]);
+                this.offset += to_copy;
+
+                if this.offset >= buffer.len() {
+                    this.buffer = None;
+                    this.offset = 0;
+                }
+                return Poll::Ready(Ok(()));
+            }
+        }
+
+        // Try to get next chunk from field
+        let fut = this.field.chunk();
+        tokio::pin!(fut);
+
+        match fut.poll(cx) {
+            Poll::Ready(Ok(Some(chunk))) => {
+                let to_copy = std::cmp::min(chunk.len(), buf.remaining());
+                buf.put_slice(&chunk[..to_copy]);
+
+                if to_copy < chunk.len() {
+                    // Store remaining data for next read
+                    this.buffer = Some(chunk);
+                    this.offset = to_copy;
+                }
+
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Ok(None)) => {
+                // EOF
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+#[async_trait]
+trait Driver: Send + Sync {
     fn write_file(
         &self,
         filename: String,
         data: Vec<u8>,
+        cont_type: String,
+        owner_email: Option<String>,
+    ) -> String;
+    async fn write_file_streaming(
+        &self,
+        filename: String,
+        data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         cont_type: String,
         owner_email: Option<String>,
     ) -> String;
@@ -472,116 +555,141 @@ async fn ax_post_file(
 
     debug_log!("Uploading file");
     let mut path: String = "".to_string();
-    let mut file0: Vec<u8> = Vec::new();
     let mut file0_filename: String = "".to_string();
-
-    // verify upload permissions, some users have upload permissions only for certain prefix(path)
-    // check config.toml for upload_prefixes
-    match verify_upload_permissions(&owner, &path) {
-        Ok(_) => (),
-        Err(e) => return (StatusCode::FORBIDDEN, e.to_string().into_bytes()),
-    }
+    let mut upload_result: Option<(StatusCode, Vec<u8>)> = None;
 
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
-        //let filename = field.file_name();
-        let filename = field.file_name().map(|f| f.to_string()); // Map filename to avoid borrowing later, how this black magic works?!?!?!
-        let data = field.bytes().await;
+        let filename = field.file_name().map(|f| f.to_string());
 
-        match data {
-            Ok(data) => {
-                debug_log!("Field {}: {} bytes", name, data.len());
-                if name == "path" {
+        if name == "path" {
+            let data = field.bytes().await;
+            match data {
+                Ok(data) => {
                     path = String::from_utf8(data.to_vec()).unwrap();
-                } else if name == "file0" {
-                    file0 = data.to_vec();
-                    match filename {
-                        Some(filename) => file0_filename = filename.to_string(),
-                        None => {
-                            let error_msg = "No filename provided".to_string();
-                            eprintln!("{}", error_msg);
-                            return (StatusCode::BAD_REQUEST, error_msg.into_bytes());
-                        }
-                    }
-                } else {
-                    debug_log!("Unknown field {}: {} bytes", name, data.len());
+                    debug_log!("Field {}: path = {}", name, path);
+                }
+                Err(e) => {
+                    eprintln!("Error reading path field: {:?}", e);
+                    return (StatusCode::BAD_REQUEST, Vec::new());
                 }
             }
-            Err(e) => {
-                eprintln!(
-                    "Error reading file: {:?} for name {}. Axum size upload limit?",
-                    e, name
-                );
-                return (StatusCode::BAD_REQUEST, Vec::new());
+        } else if name == "file0" {
+            match filename {
+                Some(fname) => {
+                    file0_filename = fname.to_string();
+
+                    // At this point we have path and filename, so we can verify permissions and start streaming
+                    // if path ends on /, remove it
+                    if path.ends_with("/") {
+                        debug_log!("Removing trailing /, workaround");
+                        path.pop();
+                    }
+
+                    let full_path = format!("{}/{}", path, file0_filename);
+
+                    // verify upload permissions
+                    match verify_upload_permissions(&owner, &path) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            upload_result = Some((StatusCode::FORBIDDEN, e.to_string().into_bytes()));
+                            break;
+                        }
+                    }
+
+                    let hdr_content_type = headers.get("Content-Type-Upstream");
+                    let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
+
+                    // Try to acquire permit - fails immediately if upload in progress
+                    let _permit = match semaphore.try_acquire() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            upload_result = Some((
+                                StatusCode::CONFLICT,
+                                "Upload already in progress".to_string().into_bytes(),
+                            ));
+                            break;
+                        }
+                    };
+
+                    let content_type: String = match hdr_content_type {
+                        Some(content_type) => content_type.to_str().unwrap().to_string(),
+                        None => {
+                            let heuristic_ctype = heuristic_filetype(file0_filename.clone());
+                            debug_log!(
+                                "Content-Type not found, using heuristics: {}",
+                                heuristic_ctype
+                            );
+                            heuristic_ctype
+                        }
+                    };
+
+                    // Stream the file upload directly
+                    debug_log!("Starting streaming upload for {}", full_path);
+                    let mut field_stream = FieldStream::new(field);
+                    let driver_name = get_driver_type();
+                    let driver = init_driver(&driver_name);
+
+                    let result = driver.write_file_streaming(
+                        full_path.clone(),
+                        &mut field_stream,
+                        content_type.to_string(),
+                        Some(owner.clone()),
+                    ).await;
+
+                    if result.is_empty() {
+                        upload_result = Some((StatusCode::CONFLICT, Vec::new()));
+                        break;
+                    }
+
+                    let status = StatusCode::OK;
+                    let client_ip = client_ip_from_headers(&headers, remote_addr);
+                    let timestamp = std::time::SystemTime::now();
+                    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
+                    let request_target = original_uri.to_string();
+                    println!(
+                        "{} {} {} {} {} {} {} {}",
+                        client_ip,
+                        status.as_u16(),
+                        "streaming",
+                        human_time,
+                        Method::POST,
+                        request_target,
+                        full_path,
+                        owner
+                    );
+
+                    upload_result = Some((status, Vec::new()));
+                    break;
+                }
+                None => {
+                    let error_msg = "No filename provided".to_string();
+                    eprintln!("{}", error_msg);
+                    upload_result = Some((StatusCode::BAD_REQUEST, error_msg.into_bytes()));
+                    break;
+                }
+            }
+        } else {
+            let data = field.bytes().await;
+            match data {
+                Ok(data) => {
+                    debug_log!("Unknown field {}: {} bytes", name, data.len());
+                }
+                Err(e) => {
+                    eprintln!("Error reading field {}: {:?}", name, e);
+                }
             }
         }
     }
-    debug_log!("Upload: {} bytes, {}/{}", file0.len(), path, file0_filename);
-    // if path ends on /, remove it
-    if path.ends_with("/") {
-        // TBD: Fix it!
-        debug_log!("Removing trailing /, workaround");
-        path.pop();
+
+    // Return the upload result if we processed the file
+    if let Some(result) = upload_result {
+        return result;
     }
 
-    let full_path = format!("{}/{}", path, file0_filename);
-    let hdr_content_type = headers.get("Content-Type-Upstream");
-    let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
-
-    // Try to acquire permit - fails immediately if upload in progress
-    let _permit = match semaphore.try_acquire() {
-        Ok(permit) => permit,
-        Err(_) => {
-            return (
-                StatusCode::CONFLICT,
-                "Upload already in progress".to_string().into_bytes(),
-            );
-        }
-    };
-
-    let content_type: String = match hdr_content_type {
-        Some(content_type) => content_type.to_str().unwrap().to_string(),
-        None => {
-            let heuristic_ctype = heuristic_filetype(file0_filename);
-            debug_log!(
-                "Content-Type not found, using heuristics: {}",
-                heuristic_ctype
-            );
-            heuristic_ctype
-        }
-    };
-
-    // TBD
-    let upload_size = file0.len();
-    let message = write_file_driver(
-        full_path.clone(),
-        file0,
-        content_type.to_string(),
-        Some(owner.clone()),
-    );
-    if !message.is_empty() {
-        return (StatusCode::CONFLICT, Vec::new());
-    }
-    let status = StatusCode::OK;
-    let client_ip = client_ip_from_headers(&headers, remote_addr);
-    let timestamp = std::time::SystemTime::now();
-    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
-    let request_target = original_uri.to_string();
-    println!(
-        "{} {} {} {} {} {} {} {}",
-        client_ip,
-        status.as_u16(),
-        upload_size,
-        human_time,
-        Method::POST,
-        request_target,
-        full_path,
-        owner
-    );
-    // write metadata file into cache directory
-    //let metadata_filename = format!("{}/{}.metadata", path, file0_filename);
-    //write_cache_metadata(metadata_filename, file0.len());
-    (status, Vec::new())
+    // If we get here, something went wrong (no file0 field found)
+    debug_log!("No file0 field found in multipart upload");
+    (StatusCode::BAD_REQUEST, b"No file0 field in upload".to_vec())
 }
 
 fn filename_from_fullpath(filepath: &str) -> String {

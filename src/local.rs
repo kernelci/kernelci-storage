@@ -3,6 +3,7 @@
 // Author: Denys Fedoryshchenko <denys.f@collabora.com>
 
 use crate::{debug_log, get_config_content, ReceivedFile};
+use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use chksum_hash_sha2_512 as sha2_512;
 use headers::HeaderMap;
@@ -10,6 +11,7 @@ use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 use toml::Table;
 
 pub struct LocalDriver;
@@ -91,7 +93,57 @@ fn calculate_checksum(filename: &str, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
-/// Write file to local storage
+/// Write file to local storage using streaming (new version)
+async fn write_file_to_local_streaming(
+    filename: String,
+    data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    cont_type: String,
+    owner_email: Option<String>,
+) -> Result<String, String> {
+    let file_path = get_storage_file_path(&filename);
+
+    // Ensure directory structure exists
+    if let Err(e) = ensure_directory_exists(&file_path) {
+        return Err(format!("Failed to create directory structure: {}", e));
+    }
+
+    // Write the file with streaming
+    let mut file = tokio::fs::File::create(&file_path)
+        .await
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+
+    let mut buffer = vec![0u8; 10 * 1024 * 1024]; // 10MB buffer
+    let mut total_bytes = 0;
+
+    loop {
+        match data.read(&mut buffer).await {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                tokio::io::AsyncWriteExt::write_all(&mut file, &buffer[..n])
+                    .await
+                    .map_err(|e| format!("Failed to write file: {}", e))?;
+                total_bytes += n;
+                debug_log!("Written {} bytes to local storage", total_bytes);
+            }
+            Err(e) => return Err(format!("Failed to read stream: {}", e)),
+        }
+    }
+
+    // Create and write metadata (headers and owner tag)
+    let metadata_path = get_metadata_file_path(&filename);
+    if let Ok(mut metadata_file) = File::create(&metadata_path) {
+        let mut metadata_content = format!("content-type:{}\n", cont_type);
+        if let Some(email) = owner_email {
+            metadata_content.push_str(&format!("tag-owner:{}\n", email));
+        }
+        let _ = metadata_file.write_all(metadata_content.as_bytes());
+    }
+
+    debug_log!("File written to local storage: {}", file_path.display());
+    Ok(filename)
+}
+
+/// Write file to local storage (legacy version using Vec<u8>)
 fn write_file_to_local(
     filename: String,
     data: Vec<u8>,
@@ -272,6 +324,7 @@ fn set_tags_for_local_file(
 }
 
 /// Implement Driver trait for LocalDriver
+#[async_trait]
 impl super::Driver for LocalDriver {
     fn write_file(
         &self,
@@ -284,6 +337,22 @@ impl super::Driver for LocalDriver {
             Ok(_) => filename,
             Err(e) => {
                 eprintln!("Local storage write error: {}", e);
+                String::new()
+            }
+        }
+    }
+
+    async fn write_file_streaming(
+        &self,
+        filename: String,
+        data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        cont_type: String,
+        owner_email: Option<String>,
+    ) -> String {
+        match write_file_to_local_streaming(filename.clone(), data, cont_type, owner_email).await {
+            Ok(_) => filename,
+            Err(e) => {
+                eprintln!("Local storage streaming write error: {}", e);
                 String::new()
             }
         }
