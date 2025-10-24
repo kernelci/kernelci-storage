@@ -83,7 +83,7 @@ async fn write_file_to_blob_streaming(
     data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     cont_type: String,
     owner_email: Option<String>,
-) -> &'static str {
+) -> (&'static str, usize) {
     let azure_cfg = Arc::new(get_azure_credentials("azure"));
 
     let storage_account = azure_cfg.account.as_str();
@@ -177,7 +177,7 @@ async fn write_file_to_blob_streaming(
             eprintln!("Error uploading block list: {:?}", e);
         }
     }
-    "OK"
+    ("OK", total_bytes_uploaded)
 }
 
 /// Write file to Azure blob storage (legacy version using Vec<u8>)
@@ -557,9 +557,9 @@ impl super::Driver for AzureDriver {
         data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         cont_type: String,
         owner_email: Option<String>,
-    ) -> String {
-        write_file_to_blob_streaming(filename.clone(), data, cont_type, owner_email).await;
-        filename
+    ) -> (String, usize) {
+        let (_status, size) = write_file_to_blob_streaming(filename.clone(), data, cont_type, owner_email).await;
+        (filename, size)
     }
     fn tag_file(
         &self,

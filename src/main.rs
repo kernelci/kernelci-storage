@@ -194,7 +194,7 @@ trait Driver: Send + Sync {
         data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         cont_type: String,
         owner_email: Option<String>,
-    ) -> String;
+    ) -> (String, usize);
     fn get_file(&self, filename: String) -> ReceivedFile;
     fn tag_file(
         &self,
@@ -630,7 +630,7 @@ async fn ax_post_file(
                     let driver_name = get_driver_type();
                     let driver = init_driver(&driver_name);
 
-                    let result = driver.write_file_streaming(
+                    let (result, file_size) = driver.write_file_streaming(
                         full_path.clone(),
                         &mut field_stream,
                         content_type.to_string(),
@@ -651,7 +651,7 @@ async fn ax_post_file(
                         "{} {} {} {} {} {} {} {}",
                         client_ip,
                         status.as_u16(),
-                        "streaming",
+                        file_size,
                         human_time,
                         Method::POST,
                         request_target,

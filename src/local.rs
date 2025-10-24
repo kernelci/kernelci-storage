@@ -99,7 +99,7 @@ async fn write_file_to_local_streaming(
     data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     cont_type: String,
     owner_email: Option<String>,
-) -> Result<String, String> {
+) -> Result<(String, usize), String> {
     let file_path = get_storage_file_path(&filename);
 
     // Ensure directory structure exists
@@ -140,7 +140,7 @@ async fn write_file_to_local_streaming(
     }
 
     debug_log!("File written to local storage: {}", file_path.display());
-    Ok(filename)
+    Ok((filename, total_bytes))
 }
 
 /// Write file to local storage (legacy version using Vec<u8>)
@@ -348,12 +348,12 @@ impl super::Driver for LocalDriver {
         data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
         cont_type: String,
         owner_email: Option<String>,
-    ) -> String {
+    ) -> (String, usize) {
         match write_file_to_local_streaming(filename.clone(), data, cont_type, owner_email).await {
-            Ok(_) => filename,
+            Ok((fname, size)) => (fname, size),
             Err(e) => {
                 eprintln!("Local storage streaming write error: {}", e);
-                String::new()
+                (String::new(), 0)
             }
         }
     }
