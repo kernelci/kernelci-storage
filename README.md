@@ -5,7 +5,7 @@ It supports multiple backends: Azure Blob Storage and local filesystem, to provi
 It caches the files in a local directory and serves them from there.
 Range requests are supported, but only for start offset, end limit is not implemented yet.
 Files are protected by upload locking to prevent concurrent uploads to the same path.
-To limit disk usage, a background housekeeping loop samples disk space every five minutes and deletes the oldest cached files (older than an hour) whenever free space drops below 12%.
+To limit disk usage, a background housekeeping loop samples disk space every five minutes and deletes the oldest cached files (older than an hour) whenever free space drops below 12%. A housekeeping summary is logged every five minutes showing the current free space, cache size, and any clean-up actions taken.
 
 ## Configuration
 
