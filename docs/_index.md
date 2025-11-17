@@ -90,7 +90,7 @@ curl https://files.kernelci.org/metrics
 
 - **JWT Authentication**: Secure token-based authentication for uploads
 - **Multiple Storage Backends**: Currently supports Azure Blob Storage with extensible driver architecture
-- **Local Caching**: Files are cached locally with automatic cleanup when disk space is low
+- **Local Caching**: Files are cached locally with automatic cleanup when disk space is low; disk space is sampled every five minutes and the least recently updated cached files older than an hour are removed until space recovers
 - **Range Request Support**: Partial content downloads using HTTP range requests
 - **File Locking**: Prevents concurrent uploads to the same file path
 - **Prometheus Metrics**: System monitoring and metrics collection

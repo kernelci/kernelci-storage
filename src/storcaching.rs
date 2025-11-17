@@ -125,8 +125,8 @@ pub async fn cache_loop(cache_dir: &str) {
             tokio::time::sleep(Duration::from_millis(100)).await;
         } else {
             debug_log!("Free disk space: {}%", free_space);
-            // normal mode, sleep 10 seconds
-            tokio::time::sleep(Duration::from_secs(10)).await;
+            // normal mode, sleep 5 minutes between samples
+            tokio::time::sleep(Duration::from_secs(300)).await;
         }
     }
 }
