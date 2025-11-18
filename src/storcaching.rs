@@ -1,7 +1,7 @@
 use crate::{debug_log, get_config_content};
 use serde::Deserialize;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
@@ -367,5 +367,100 @@ pub async fn cache_loop(cache_dir: &str) {
         }
 
         tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_INTERVAL_SECS)).await;
+    }
+}
+
+fn remove_zero_sized_files(cache_dir: &str) -> u64 {
+    let mut removed = 0;
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Error reading cache directory during zero-sized cleanup: {}", e);
+            return 0;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+
+        if !metadata.is_file() || metadata.len() != 0 {
+            continue;
+        }
+
+        if let Err(e) = fs::remove_file(&path) {
+            debug_log!("Failed to remove zero-sized file {:?}: {}", path, e);
+        } else {
+            removed += 1;
+        }
+    }
+
+    removed
+}
+
+fn remove_orphan_files(cache_dir: &str) -> u64 {
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Error reading cache directory during orphan cleanup: {}", e);
+            return 0;
+        }
+    };
+
+    let mut contents = HashSet::new();
+    let mut headers = HashSet::new();
+
+    for entry in entries.flatten() {
+        let path = match entry.path().to_str() {
+            Some(path) => path.to_string(),
+            None => continue,
+        };
+
+        if let Some(base) = path.strip_suffix(".content") {
+            contents.insert(base.to_string());
+        } else if let Some(base) = path.strip_suffix(".headers") {
+            headers.insert(base.to_string());
+        }
+    }
+
+    let mut removed = 0;
+
+    for base in contents.difference(&headers) {
+        let file = format!("{}.content", base);
+        if let Err(e) = fs::remove_file(&file) {
+            debug_log!("Failed to remove orphan content {}: {}", file, e);
+        } else {
+            removed += 1;
+        }
+    }
+
+    for base in headers.difference(&contents) {
+        let file = format!("{}.headers", base);
+        if let Err(e) = fs::remove_file(&file) {
+            debug_log!("Failed to remove orphan headers {}: {}", file, e);
+        } else {
+            removed += 1;
+        }
+    }
+
+    removed
+}
+
+fn run_cache_validation(cache_dir: String) {
+    let zero_removed = remove_zero_sized_files(&cache_dir);
+    let orphan_removed = remove_orphan_files(&cache_dir);
+
+    println!(
+        "[cache-validation] removed {} zero-sized files and {} orphaned cache entries.",
+        zero_removed, orphan_removed
+    );
+}
+
+pub async fn validate_cache(cache_dir: String) {
+    if let Err(e) = tokio::task::spawn_blocking(move || run_cache_validation(cache_dir)).await {
+        eprintln!("Cache validation task failed: {}", e);
     }
 }

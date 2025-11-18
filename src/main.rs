@@ -305,6 +305,7 @@ async fn initial_setup() -> Option<RustlsConfig> {
         std::fs::create_dir(cache_dir).unwrap();
     }
 
+    let _validation = tokio::spawn(storcaching::validate_cache(cache_dir.to_string()));
     let _handle = tokio::spawn(storcaching::cache_loop(cache_dir));
 
     if !std::path::Path::new(download_dir).exists() {
