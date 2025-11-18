@@ -90,7 +90,7 @@ curl https://files.kernelci.org/metrics
 
 - **JWT Authentication**: Secure token-based authentication for uploads
 - **Multiple Storage Backends**: Currently supports Azure Blob Storage with extensible driver architecture
-- **Local Caching**: Files are cached locally with automatic cleanup when disk space is low
+- **Local Caching**: Files are cached locally with automatic cleanup rules; housekeeping enforces a hard limit of 1,000,000 cached entries, deletes the oldest files in configurable batches (default 100,000 files), and frees disk space whenever available space falls below 12%
 - **Range Request Support**: Partial content downloads using HTTP range requests
 - **File Locking**: Prevents concurrent uploads to the same file path
 - **Prometheus Metrics**: System monitoring and metrics collection
@@ -156,6 +156,17 @@ prefixes = ["/allowed/path1", "/allowed/path2"]
 name = "admin@example.com"
 prefixes = [""]  # Empty prefix allows access to all paths
 ```
+
+### Cache Housekeeping
+
+The cache directory is capped at 1,000,000 cached artifacts (`*.content` files). When the limit is exceeded—or when disk space drops below 12%—the housekeeping worker deletes the oldest entries in batches. The batch size defaults to 100,000 files and can be overridden in the configuration file:
+
+```toml
+[cache]
+cleanup_chunk_size = 100000
+```
+
+Raising the value makes each cleanup iteration more aggressive; lowering it favors smaller, more frequent deletions.
 
 ## Environment Variables
 
