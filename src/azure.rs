@@ -11,6 +11,7 @@ impl AzureDriver {
 }
 
 use crate::{debug_log, get_config_content, ReceivedFile};
+use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::container::operations::BlobItem;
@@ -26,6 +27,7 @@ use std::io::Read;
 use std::io::Write;
 use std::sync::Arc;
 use tempfile::Builder;
+use tokio::io::AsyncReadExt;
 use toml::Table;
 
 #[derive(Deserialize)]
@@ -75,7 +77,110 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
-/// Write file to Azure blob storage
+/// Write file to Azure blob storage using streaming (new version)
+async fn write_file_to_blob_streaming(
+    filename: String,
+    data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    cont_type: String,
+    owner_email: Option<String>,
+) -> (&'static str, usize) {
+    let azure_cfg = Arc::new(get_azure_credentials("azure"));
+
+    let storage_account = azure_cfg.account.as_str();
+    let storage_key = azure_cfg.key.clone();
+    let storage_container = azure_cfg.container.as_str();
+    let storage_blob = filename.as_str();
+    let storage_credential = StorageCredentials::access_key(storage_account, storage_key);
+    let blob_client = ClientBuilder::new(storage_account, storage_credential)
+        .blob_client(storage_container, storage_blob);
+
+    let mut total_bytes_uploaded: usize = 0;
+    let chunk_size = 10 * 1024 * 1024; // 10MB chunks
+    let mut blocks = BlockList::default();
+
+    loop {
+        let mut buffer = vec![0u8; chunk_size];
+        let bytes_read = data.read(&mut buffer).await;
+        match bytes_read {
+            Ok(bytes_read) => {
+                if bytes_read == 0 {
+                    break;
+                }
+                buffer.truncate(bytes_read);
+                let block_id = BlockId::new(hex::encode(total_bytes_uploaded.to_le_bytes()));
+                blocks
+                    .blocks
+                    .push(BlobBlockType::Uncommitted(block_id.clone()));
+                match blob_client.put_block(block_id, buffer).await {
+                    Ok(_) => {
+                        total_bytes_uploaded += bytes_read;
+                        debug_log!("Uploaded {} bytes", total_bytes_uploaded);
+                    }
+                    Err(e) => {
+                        eprintln!("Error uploading block: {:?}", e);
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading stream: {:?}", e);
+                break;
+            }
+        }
+    }
+    match blob_client
+        .put_block_list(blocks)
+        .content_type(cont_type)
+        .await
+    {
+        Ok(_) => {
+            debug_log!("Block list uploaded");
+            let blob_url_res = blob_client.url();
+            match blob_url_res {
+                Ok(blob_url) => {
+                    debug_log!("Blob URL: {}", blob_url);
+                }
+                Err(e) => {
+                    eprintln!("Error getting blob URL: {:?}", e);
+                }
+            }
+
+            // Set owner tag if email is provided
+            if let Some(email) = owner_email {
+                let mut tags = Tags::new();
+                let sanitized = sanitize_tag_component(&email);
+                if sanitized != email {
+                    debug_log!(
+                        "Sanitized owner tag value from '{}' to '{}'",
+                        email,
+                        sanitized
+                    );
+                }
+                // Ensure non-empty value
+                let final_value = if sanitized.is_empty() {
+                    "_".to_string()
+                } else {
+                    sanitized
+                };
+                tags.insert("owner".to_string(), final_value);
+                match blob_client.set_tags(tags).await {
+                    Ok(_) => {
+                        debug_log!("Owner tag set successfully");
+                    }
+                    Err(e) => {
+                        eprintln!("Error setting owner tag: {:?}", e);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error uploading block list: {:?}", e);
+        }
+    }
+    ("OK", total_bytes_uploaded)
+}
+
+/// Write file to Azure blob storage (legacy version using Vec<u8>)
 /// TBD: Rework, do not keep whole file as Vec<u8> in memory!!!
 async fn write_file_to_blob(
     filename: String,
@@ -429,6 +534,7 @@ async fn azure_list_files(directory: String) -> Vec<String> {
 }
 
 /// Implement Driver trait for AzureDriver
+#[async_trait]
 impl super::Driver for AzureDriver {
     fn write_file(
         &self,
@@ -444,6 +550,16 @@ impl super::Driver for AzureDriver {
             rt.block_on(write_file_to_blob(filename, data, cont_type, owner_email));
         });
         filenameret
+    }
+    async fn write_file_streaming(
+        &self,
+        filename: String,
+        data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+        cont_type: String,
+        owner_email: Option<String>,
+    ) -> (String, usize) {
+        let (_status, size) = write_file_to_blob_streaming(filename.clone(), data, cont_type, owner_email).await;
+        (filename, size)
     }
     fn tag_file(
         &self,
