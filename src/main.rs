@@ -601,13 +601,25 @@ async fn ax_post_file(
                     let hdr_content_type = headers.get("Content-Type-Upstream");
                     let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
 
-                    // Try to acquire permit - fails immediately if upload in progress
-                    let _permit = match semaphore.try_acquire() {
-                        Ok(permit) => permit,
+                    // Try to acquire permit - wait for up to 30 seconds
+                    let _permit = match tokio::time::timeout(
+                        tokio::time::Duration::from_secs(30),
+                        semaphore.acquire(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(permit)) => permit,
+                        Ok(Err(_)) => {
+                            upload_result = Some((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Semaphore closed".to_string().into_bytes(),
+                            ));
+                            break;
+                        }
                         Err(_) => {
                             upload_result = Some((
                                 StatusCode::CONFLICT,
-                                "Upload already in progress".to_string().into_bytes(),
+                                "Timeout waiting for upload".to_string().into_bytes(),
                             ));
                             break;
                         }
