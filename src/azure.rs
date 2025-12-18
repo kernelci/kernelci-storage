@@ -53,6 +53,18 @@ fn sanitize_tag_component(input: &str) -> String {
         .collect()
 }
 
+fn normalize_sas_token(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.starts_with('?') {
+        trimmed.to_string()
+    } else {
+        format!("?{}", trimmed)
+    }
+}
+
 /// Get Azure credentials from config.toml
 fn get_azure_credentials(name: &str) -> AzureConfig {
     let cfg_content = get_config_content();
@@ -67,7 +79,30 @@ fn get_azure_credentials(name: &str) -> AzureConfig {
         account: account.to_string(),
         key: key.to_string(),
         container: container.to_string(),
-        sastoken: sastoken.to_string(),
+        sastoken: normalize_sas_token(sastoken),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sas_token;
+
+    #[test]
+    fn sas_token_is_left_empty() {
+        assert_eq!(normalize_sas_token(""), "");
+        assert_eq!(normalize_sas_token("   "), "");
+    }
+
+    #[test]
+    fn sas_token_is_left_intact_when_prefixed() {
+        assert_eq!(normalize_sas_token("?sv=1"), "?sv=1");
+        assert_eq!(normalize_sas_token(" ?sv=1 "), "?sv=1");
+    }
+
+    #[test]
+    fn sas_token_is_prefixed_when_missing_question_mark() {
+        assert_eq!(normalize_sas_token("sv=1"), "?sv=1");
+        assert_eq!(normalize_sas_token(" sv=1 "), "?sv=1");
     }
 }
 
