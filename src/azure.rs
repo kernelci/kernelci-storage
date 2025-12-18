@@ -440,7 +440,36 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             // is status anything else than 200?
             // TODO: Do we need to return headers as well or it is data leakage?
             if response.status() != 200 {
-                eprintln!("Error getting blob: {:?}", response.status());
+                let status = response.status();
+                let headers = response.headers().clone();
+                let ms_error_code = headers
+                    .get("x-ms-error-code")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<missing>");
+                let ms_request_id = headers
+                    .get("x-ms-request-id")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<missing>");
+                let content_type = headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("<missing>");
+                let body_preview = match response.bytes().await {
+                    Ok(bytes) => {
+                        let mut preview = String::from_utf8_lossy(&bytes).into_owned();
+                        const MAX_LEN: usize = 4096;
+                        if preview.len() > MAX_LEN {
+                            preview.truncate(MAX_LEN);
+                            preview.push_str("…<truncated>");
+                        }
+                        preview
+                    }
+                    Err(e) => format!("<failed to read body: {e}>"),
+                };
+
+                eprintln!(
+                    "Error getting blob: {status} (x-ms-error-code={ms_error_code}, x-ms-request-id={ms_request_id}, content-type={content_type}) body={body_preview}"
+                );
                 return received_file;
             }
             received_file.headers = response.headers().clone();
