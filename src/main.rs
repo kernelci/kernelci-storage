@@ -576,6 +576,12 @@ async fn ax_post_file(
                 }
             }
         } else if name == "file0" {
+            if path.is_empty() {
+                let error_msg = "Missing path field before file0".to_string();
+                eprintln!("{}", error_msg);
+                upload_result = Some((StatusCode::BAD_REQUEST, error_msg.into_bytes()));
+                break;
+            }
             match filename {
                 Some(fname) => {
                     file0_filename = fname.to_string();
