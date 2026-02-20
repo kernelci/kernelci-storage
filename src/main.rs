@@ -33,7 +33,7 @@ use headers::HeaderMap;
 use std::path;
 use std::sync::OnceLock;
 use std::{net::SocketAddr, path::PathBuf};
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 use std::{collections::HashMap, sync::Arc};
 use std::pin::Pin;
@@ -558,6 +558,7 @@ async fn ax_post_file(
     let mut path: String = "".to_string();
     let mut file0_filename: String = "".to_string();
     let mut upload_result: Option<(StatusCode, Vec<u8>)> = None;
+    let mut buffered_file: Option<tempfile::NamedTempFile> = None;
 
     while let Some(field) = multipart.next_field().await.unwrap() {
         let name = field.name().unwrap().to_string();
@@ -576,17 +577,79 @@ async fn ax_post_file(
                 }
             }
         } else if name == "file0" {
-            if path.is_empty() {
-                let error_msg = "Missing path field before file0".to_string();
-                eprintln!("{}", error_msg);
-                upload_result = Some((StatusCode::BAD_REQUEST, error_msg.into_bytes()));
-                break;
-            }
             match filename {
                 Some(fname) => {
                     file0_filename = fname.to_string();
 
-                    // At this point we have path and filename, so we can verify permissions and start streaming
+                    if path.is_empty() {
+                        // BUFFERED PATH: file0 arrived before path, buffer to temp file
+                        debug_log!("file0 arrived before path, buffering to temp file");
+                        let tmp = match tempfile::NamedTempFile::new() {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("Failed to create temp file: {:?}", e);
+                                upload_result = Some((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Failed to create temp file".to_string().into_bytes(),
+                                ));
+                                break;
+                            }
+                        };
+                        let tmp_path = tmp.path().to_path_buf();
+                        let mut async_file = match tokio::fs::File::create(&tmp_path).await {
+                            Ok(f) => f,
+                            Err(e) => {
+                                eprintln!("Failed to open temp file for writing: {:?}", e);
+                                upload_result = Some((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Failed to open temp file".to_string().into_bytes(),
+                                ));
+                                break;
+                            }
+                        };
+                        let mut field_stream = FieldStream::new(field);
+                        let mut buf = [0u8; 64 * 1024];
+                        loop {
+                            use tokio::io::AsyncReadExt;
+                            let n = match field_stream.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(e) => {
+                                    eprintln!("Error reading file0 field: {:?}", e);
+                                    upload_result = Some((
+                                        StatusCode::BAD_REQUEST,
+                                        "Error reading file data".to_string().into_bytes(),
+                                    ));
+                                    break;
+                                }
+                            };
+                            if let Err(e) = async_file.write_all(&buf[..n]).await {
+                                eprintln!("Error writing temp file: {:?}", e);
+                                upload_result = Some((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Error writing temp file".to_string().into_bytes(),
+                                ));
+                                break;
+                            }
+                        }
+                        if upload_result.is_some() {
+                            break;
+                        }
+                        if let Err(e) = async_file.flush().await {
+                            eprintln!("Error flushing temp file: {:?}", e);
+                            upload_result = Some((
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "Error flushing temp file".to_string().into_bytes(),
+                            ));
+                            break;
+                        }
+                        drop(async_file);
+                        buffered_file = Some(tmp);
+                        // Continue loop to find path field
+                        continue;
+                    }
+
+                    // FAST PATH: path already set, stream directly
                     // if path ends on /, remove it
                     if path.ends_with("/") {
                         debug_log!("Removing trailing /, workaround");
@@ -698,6 +761,106 @@ async fn ax_post_file(
                     eprintln!("Error reading field {}: {:?}", name, e);
                 }
             }
+        }
+    }
+
+    // Handle buffered file0 case (file0 arrived before path)
+    if upload_result.is_none() {
+        if let Some(tmp) = buffered_file {
+            if path.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    b"Missing path field in upload".to_vec(),
+                );
+            }
+
+            if path.ends_with("/") {
+                debug_log!("Removing trailing /, workaround");
+                path.pop();
+            }
+
+            let full_path = format!("{}/{}", path, file0_filename);
+
+            match verify_upload_permissions(&owner, &path) {
+                Ok(_) => (),
+                Err(e) => {
+                    return (StatusCode::FORBIDDEN, e.to_string().into_bytes());
+                }
+            }
+
+            let hdr_content_type = headers.get("Content-Type-Upstream");
+            let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
+
+            let _permit = match semaphore.try_acquire() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    return (
+                        StatusCode::CONFLICT,
+                        "Upload already in progress".to_string().into_bytes(),
+                    );
+                }
+            };
+
+            let content_type: String = match hdr_content_type {
+                Some(content_type) => content_type.to_str().unwrap().to_string(),
+                None => {
+                    let heuristic_ctype = heuristic_filetype(file0_filename.clone());
+                    debug_log!(
+                        "Content-Type not found, using heuristics: {}",
+                        heuristic_ctype
+                    );
+                    heuristic_ctype
+                }
+            };
+
+            debug_log!("Starting buffered upload for {}", full_path);
+            let mut async_file = match tokio::fs::File::open(tmp.path()).await {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("Failed to reopen temp file: {:?}", e);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Failed to reopen temp file".to_string().into_bytes(),
+                    );
+                }
+            };
+
+            let driver_name = get_driver_type();
+            let driver = init_driver(&driver_name);
+
+            let (result, file_size) = driver
+                .write_file_streaming(
+                    full_path.clone(),
+                    &mut async_file,
+                    content_type.to_string(),
+                    Some(owner.clone()),
+                )
+                .await;
+
+            // tmp (NamedTempFile) is dropped here, auto-deleting the temp file
+
+            if result.is_empty() {
+                return (StatusCode::CONFLICT, Vec::new());
+            }
+
+            let status = StatusCode::OK;
+            let client_ip = client_ip_from_headers(&headers, remote_addr);
+            let timestamp = std::time::SystemTime::now();
+            let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
+            let request_target = original_uri.to_string();
+            println!(
+                "{} {} {} {} {} {} {} {} buggyclient",
+                client_ip,
+                status.as_u16(),
+                file_size,
+                human_time,
+                Method::POST,
+                request_target,
+                full_path,
+                owner
+            );
+
+            return (status, Vec::new());
         }
     }
 
