@@ -102,6 +102,17 @@ async fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<
         .clone()
 }
 
+/// Remove semaphore entries that are no longer in use (strong_count == 1 means
+/// only the map itself holds a reference).
+async fn cleanup_semaphore(locks: &FileSemaphores, filename: &str) {
+    let mut map = locks.write().await;
+    if let Some(sem) = map.get(filename) {
+        if Arc::strong_count(sem) == 1 {
+            map.remove(filename);
+        }
+    }
+}
+
 struct ReceivedFile {
     original_filename: String,
     cached_filename: String,
@@ -566,6 +577,7 @@ async fn ax_post_file(
     let mut file0_filename: String = "".to_string();
     let mut upload_result: Option<(StatusCode, Vec<u8>)> = None;
     let mut buffered_file: Option<tempfile::NamedTempFile> = None;
+    let mut locked_path: Option<String> = None;
 
     while let Some(field) = match multipart.next_field().await {
         Ok(field) => field,
@@ -694,6 +706,7 @@ async fn ax_post_file(
 
                     let hdr_content_type = headers.get("Content-Type-Upstream");
                     let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
+                    locked_path = Some(full_path.clone());
 
                     // Try to acquire permit - wait for up to 30 seconds
                     let _permit = match tokio::time::timeout(
@@ -789,6 +802,11 @@ async fn ax_post_file(
         }
     }
 
+    // Clean up semaphore from the fast path (permit already dropped by leaving the loop)
+    if let Some(ref lp) = locked_path {
+        cleanup_semaphore(&state.file_locks, lp).await;
+    }
+
     // Handle buffered file0 case (file0 arrived before path)
     if upload_result.is_none() {
         if let Some(tmp) = buffered_file {
@@ -870,6 +888,9 @@ async fn ax_post_file(
                 .await;
 
             // tmp (NamedTempFile) is dropped here, auto-deleting the temp file
+
+            drop(_permit);
+            cleanup_semaphore(&state.file_locks, &full_path).await;
 
             if result.is_empty() {
                 return (StatusCode::CONFLICT, Vec::new());
@@ -958,6 +979,11 @@ async fn ax_get_file(
 
     // IMPORTANT! Headers in cache must be stored in lowercase
     let received_file = driver_get_file(filepath.clone());
+
+    // Release the semaphore now that the file is resolved
+    drop(_permit);
+    cleanup_semaphore(&state.file_locks, &filepath).await;
+
     if !received_file.valid {
         println!(
             "{:?} 404 0 {} {} {} {}",
