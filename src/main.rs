@@ -491,6 +491,13 @@ prefixes = ["/bob"]
 prefixes = [""]
 */
 
+fn validate_path(path: &str) -> Result<(), String> {
+    if path.contains("..") {
+        return Err("Path traversal detected".to_string());
+    }
+    Ok(())
+}
+
 fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
     let cfg_content = get_config_content();
     let cfg: Table = toml::from_str(&cfg_content).unwrap();
@@ -658,6 +665,15 @@ async fn ax_post_file(
 
                     let full_path = format!("{}/{}", path, file0_filename);
 
+                    // validate path for traversal
+                    match validate_path(&full_path) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            upload_result = Some((StatusCode::BAD_REQUEST, e.into_bytes()));
+                            break;
+                        }
+                    }
+
                     // verify upload permissions
                     match verify_upload_permissions(&owner, &path) {
                         Ok(_) => (),
@@ -780,6 +796,13 @@ async fn ax_post_file(
             }
 
             let full_path = format!("{}/{}", path, file0_filename);
+
+            match validate_path(&full_path) {
+                Ok(_) => (),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, e.into_bytes());
+                }
+            }
 
             match verify_upload_permissions(&owner, &path) {
                 Ok(_) => (),
