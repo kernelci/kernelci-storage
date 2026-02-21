@@ -1029,7 +1029,9 @@ async fn ax_get_file(
 
     /* Usually HEAD is used to check if the file exists and range is supported */
     if method == axum::http::Method::HEAD {
-        //println!("HEAD request, returning headers only");
+        if let Ok(val) = header::HeaderValue::from_str(&metadata.len().to_string()) {
+            headers.insert(header::CONTENT_LENGTH, val);
+        }
         println!(
             "{:?} 200 0 {} {} {} {}",
             remote_addr, human_time, method, filepath, user_agent_str
