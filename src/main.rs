@@ -1136,12 +1136,18 @@ fn parse_range(range: &str) -> (u64, u64) {
 /// Verify the Authorization header
 /// Return error message + owner if the token is correct
 fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
-    let auth = headers.get("Authorization");
-    if auth == None {
+    let auth = match headers.get("Authorization") {
+        Some(auth) => auth,
+        None => return Err(None),
+    };
+    let auth_str = match auth.to_str() {
+        Ok(s) => s,
+        Err(_) => return Err(None),
+    };
+    let token_parts: Vec<&str> = auth_str.split_whitespace().collect();
+    if token_parts.is_empty() {
         return Err(None);
     }
-    let token = auth.unwrap().to_str().unwrap().split_whitespace();
-    let token_parts: Vec<&str> = token.collect();
     if token_parts.len() != 2 {
         let verif_result = storjwt::verify_jwt_token(token_parts[0]);
         let bmap = match verif_result {
