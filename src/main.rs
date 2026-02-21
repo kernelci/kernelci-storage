@@ -1043,7 +1043,12 @@ async fn ax_get_file(
             let mut end = metadata.len();
             // is Content-Range present?
             if let Some(range) = rxheaders.get("Range") {
-                (start, end) = parse_range(range.to_str().unwrap());
+                match range.to_str().ok().and_then(parse_range) {
+                    Some(parsed) => (start, end) = parsed,
+                    None => {
+                        return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header").into_response();
+                    }
+                }
             }
             // if start is set to non-zero, we need to seek
             if start != 0 && (end == metadata.len() || end == 0) {
@@ -1128,18 +1133,12 @@ fn write_file_driver(
 
 /// Parse range header
 /// We support limited range only for now
-fn parse_range(range: &str) -> (u64, u64) {
-    let parts: Vec<&str> = range.split("=").collect();
-    let range_parts: Vec<&str> = parts[1].split("-").collect();
-    let start = range_parts[0].parse::<u64>().unwrap();
-    if range_parts.len() == 1 {
-        return (start, 0);
-    }
-    let end = range_parts[1].parse::<u64>();
-    match end {
-        Ok(end) => (start, end),
-        Err(_) => (start, 0),
-    }
+fn parse_range(range: &str) -> Option<(u64, u64)> {
+    let (_, range_spec) = range.split_once('=')?;
+    let (start_str, end_str) = range_spec.split_once('-')?;
+    let start = start_str.parse::<u64>().ok()?;
+    let end = end_str.parse::<u64>().unwrap_or(0);
+    Some((start, end))
 }
 
 /// Verify the Authorization header
