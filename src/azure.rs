@@ -415,7 +415,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
                 headers_file_exists = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(1000));
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             debug_log!(
                 "Waiting for headers file {} to exist: {} seconds",
                 cache_filename_headers,
