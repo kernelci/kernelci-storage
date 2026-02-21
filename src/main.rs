@@ -567,8 +567,17 @@ async fn ax_post_file(
     let mut upload_result: Option<(StatusCode, Vec<u8>)> = None;
     let mut buffered_file: Option<tempfile::NamedTempFile> = None;
 
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap().to_string();
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(e) => {
+            eprintln!("Error reading multipart field: {:?}", e);
+            return (StatusCode::BAD_REQUEST, b"Malformed multipart request".to_vec());
+        }
+    } {
+        let name = match field.name() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
         let filename = field.file_name().map(|f| f.to_string());
 
         if name == "path" {
