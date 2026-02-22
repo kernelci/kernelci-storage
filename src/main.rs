@@ -102,6 +102,17 @@ async fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<
         .clone()
 }
 
+/// Remove semaphore entries that are no longer in use (strong_count == 1 means
+/// only the map itself holds a reference).
+async fn cleanup_semaphore(locks: &FileSemaphores, filename: &str) {
+    let mut map = locks.write().await;
+    if let Some(sem) = map.get(filename) {
+        if Arc::strong_count(sem) == 1 {
+            map.remove(filename);
+        }
+    }
+}
+
 struct ReceivedFile {
     original_filename: String,
     cached_filename: String,
@@ -491,6 +502,13 @@ prefixes = ["/bob"]
 prefixes = [""]
 */
 
+fn validate_path(path: &str) -> Result<(), String> {
+    if path.contains("..") {
+        return Err("Path traversal detected".to_string());
+    }
+    Ok(())
+}
+
 fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
     let cfg_content = get_config_content();
     let cfg: Table = toml::from_str(&cfg_content).unwrap();
@@ -559,9 +577,19 @@ async fn ax_post_file(
     let mut file0_filename: String = "".to_string();
     let mut upload_result: Option<(StatusCode, Vec<u8>)> = None;
     let mut buffered_file: Option<tempfile::NamedTempFile> = None;
+    let mut locked_path: Option<String> = None;
 
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap().to_string();
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(e) => {
+            eprintln!("Error reading multipart field: {:?}", e);
+            return (StatusCode::BAD_REQUEST, b"Malformed multipart request".to_vec());
+        }
+    } {
+        let name = match field.name() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
         let filename = field.file_name().map(|f| f.to_string());
 
         if name == "path" {
@@ -658,6 +686,15 @@ async fn ax_post_file(
 
                     let full_path = format!("{}/{}", path, file0_filename);
 
+                    // validate path for traversal
+                    match validate_path(&full_path) {
+                        Ok(_) => (),
+                        Err(e) => {
+                            upload_result = Some((StatusCode::BAD_REQUEST, e.into_bytes()));
+                            break;
+                        }
+                    }
+
                     // verify upload permissions
                     match verify_upload_permissions(&owner, &path) {
                         Ok(_) => (),
@@ -669,6 +706,7 @@ async fn ax_post_file(
 
                     let hdr_content_type = headers.get("Content-Type-Upstream");
                     let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
+                    locked_path = Some(full_path.clone());
 
                     // Try to acquire permit - wait for up to 30 seconds
                     let _permit = match tokio::time::timeout(
@@ -764,6 +802,11 @@ async fn ax_post_file(
         }
     }
 
+    // Clean up semaphore from the fast path (permit already dropped by leaving the loop)
+    if let Some(ref lp) = locked_path {
+        cleanup_semaphore(&state.file_locks, lp).await;
+    }
+
     // Handle buffered file0 case (file0 arrived before path)
     if upload_result.is_none() {
         if let Some(tmp) = buffered_file {
@@ -780,6 +823,13 @@ async fn ax_post_file(
             }
 
             let full_path = format!("{}/{}", path, file0_filename);
+
+            match validate_path(&full_path) {
+                Ok(_) => (),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, e.into_bytes());
+                }
+            }
 
             match verify_upload_permissions(&owner, &path) {
                 Ok(_) => (),
@@ -838,6 +888,9 @@ async fn ax_post_file(
                 .await;
 
             // tmp (NamedTempFile) is dropped here, auto-deleting the temp file
+
+            drop(_permit);
+            cleanup_semaphore(&state.file_locks, &full_path).await;
 
             if result.is_empty() {
                 return (StatusCode::CONFLICT, Vec::new());
@@ -926,6 +979,11 @@ async fn ax_get_file(
 
     // IMPORTANT! Headers in cache must be stored in lowercase
     let received_file = driver_get_file(filepath.clone());
+
+    // Release the semaphore now that the file is resolved
+    drop(_permit);
+    cleanup_semaphore(&state.file_locks, &filepath).await;
+
     if !received_file.valid {
         println!(
             "{:?} 404 0 {} {} {} {}",
@@ -997,7 +1055,9 @@ async fn ax_get_file(
 
     /* Usually HEAD is used to check if the file exists and range is supported */
     if method == axum::http::Method::HEAD {
-        //println!("HEAD request, returning headers only");
+        if let Ok(val) = header::HeaderValue::from_str(&metadata.len().to_string()) {
+            headers.insert(header::CONTENT_LENGTH, val);
+        }
         println!(
             "{:?} 200 0 {} {} {} {}",
             remote_addr, human_time, method, filepath, user_agent_str
@@ -1011,7 +1071,12 @@ async fn ax_get_file(
             let mut end = metadata.len();
             // is Content-Range present?
             if let Some(range) = rxheaders.get("Range") {
-                (start, end) = parse_range(range.to_str().unwrap());
+                match range.to_str().ok().and_then(parse_range) {
+                    Some(parsed) => (start, end) = parsed,
+                    None => {
+                        return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header").into_response();
+                    }
+                }
             }
             // if start is set to non-zero, we need to seek
             if start != 0 && (end == metadata.len() || end == 0) {
@@ -1096,29 +1161,29 @@ fn write_file_driver(
 
 /// Parse range header
 /// We support limited range only for now
-fn parse_range(range: &str) -> (u64, u64) {
-    let parts: Vec<&str> = range.split("=").collect();
-    let range_parts: Vec<&str> = parts[1].split("-").collect();
-    let start = range_parts[0].parse::<u64>().unwrap();
-    if range_parts.len() == 1 {
-        return (start, 0);
-    }
-    let end = range_parts[1].parse::<u64>();
-    match end {
-        Ok(end) => (start, end),
-        Err(_) => (start, 0),
-    }
+fn parse_range(range: &str) -> Option<(u64, u64)> {
+    let (_, range_spec) = range.split_once('=')?;
+    let (start_str, end_str) = range_spec.split_once('-')?;
+    let start = start_str.parse::<u64>().ok()?;
+    let end = end_str.parse::<u64>().unwrap_or(0);
+    Some((start, end))
 }
 
 /// Verify the Authorization header
 /// Return error message + owner if the token is correct
 fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
-    let auth = headers.get("Authorization");
-    if auth == None {
+    let auth = match headers.get("Authorization") {
+        Some(auth) => auth,
+        None => return Err(None),
+    };
+    let auth_str = match auth.to_str() {
+        Ok(s) => s,
+        Err(_) => return Err(None),
+    };
+    let token_parts: Vec<&str> = auth_str.split_whitespace().collect();
+    if token_parts.is_empty() {
         return Err(None);
     }
-    let token = auth.unwrap().to_str().unwrap().split_whitespace();
-    let token_parts: Vec<&str> = token.collect();
     if token_parts.len() != 2 {
         let verif_result = storjwt::verify_jwt_token(token_parts[0]);
         let bmap = match verif_result {
