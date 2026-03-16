@@ -963,6 +963,8 @@ async fn ax_get_file(
         None => "",
     };
 
+    let client_ip = client_ip_from_headers(&rxheaders, remote_addr);
+
     let semaphore = get_or_create_semaphore(&state.file_locks, &filepath).await;
     // Wait for permit with timeout
     let _permit =
@@ -986,8 +988,8 @@ async fn ax_get_file(
 
     if !received_file.valid {
         println!(
-            "{:?} 404 0 {} {} {} {}",
-            remote_addr, human_time, method, filepath, user_agent_str
+            "{} 404 0 {} {} {} {}",
+            client_ip, human_time, method, filepath, user_agent_str
         );
         return (StatusCode::NOT_FOUND, format!("Not Found: {}", filepath)).into_response();
     }
@@ -1033,8 +1035,8 @@ async fn ax_get_file(
         if let Some(etag) = upstream_headers.get(ETAG) {
             if if_none_match == etag {
                 println!(
-                    "{:?} 304 0 {} {} {} {}",
-                    remote_addr, human_time, method, filepath, user_agent_str
+                    "{} 304 0 {} {} {} {}",
+                    client_ip, human_time, method, filepath, user_agent_str
                 );
                 return (StatusCode::NOT_MODIFIED, headers, Body::empty()).into_response();
             }
@@ -1045,8 +1047,8 @@ async fn ax_get_file(
             // TODO: Validate properly last_modified
             if if_modified_since == last_modified {
                 println!(
-                    "{:?} 304 0 {} {} {} {}",
-                    remote_addr, human_time, method, filepath, user_agent_str
+                    "{} 304 0 {} {} {} {}",
+                    client_ip, human_time, method, filepath, user_agent_str
                 );
                 return (StatusCode::NOT_MODIFIED, headers, Body::empty()).into_response();
             }
@@ -1059,8 +1061,8 @@ async fn ax_get_file(
             headers.insert(header::CONTENT_LENGTH, val);
         }
         println!(
-            "{:?} 200 0 {} {} {} {}",
-            remote_addr, human_time, method, filepath, user_agent_str
+            "{} 200 0 {} {} {} {}",
+            client_ip, human_time, method, filepath, user_agent_str
         );
         return (headers, Body::empty()).into_response();
     }
@@ -1114,14 +1116,14 @@ async fn ax_get_file(
             if start != 0 {
                 let body_size = end - start;
                 println!(
-                    "{:?} 206 {} {} {} {} {}",
-                    remote_addr, body_size, human_time, method, filepath, user_agent_str
+                    "{} 206 {} {} {} {} {}",
+                    client_ip, body_size, human_time, method, filepath, user_agent_str
                 );
                 return (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response();
             }
             println!(
-                "{:?} 200 {} {} {} {} {}",
-                remote_addr,
+                "{} 200 {} {} {} {} {}",
+                client_ip,
                 metadata.len(),
                 human_time,
                 method,
@@ -1133,8 +1135,8 @@ async fn ax_get_file(
         Err(_) => {
             eprintln!("Error opening file in ax_get_file");
             println!(
-                "{:?} 404 0 {} {} {} {}",
-                remote_addr, human_time, method, filepath, user_agent_str
+                "{} 404 0 {} {} {} {}",
+                client_ip, human_time, method, filepath, user_agent_str
             );
             (StatusCode::NOT_FOUND, headers, Body::empty()).into_response()
         }
