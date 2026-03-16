@@ -399,7 +399,10 @@ async fn main() {
     logging::init(get_args().verbose);
     tracing_subscriber::fmt::init();
     let tlscfg = initial_setup().await;
-    let port = 3000;
+    let port: u16 = std::env::var("KCI_STORAGE_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
     let state = AppState {
         file_locks: Arc::new(RwLock::new(HashMap::new())),
     };
@@ -436,7 +439,8 @@ async fn main() {
     } else {
         //let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
         //axum::serve(listener, app).await.unwrap();
-        axum_server::bind("0.0.0.0:3000".parse().unwrap())
+        let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        axum_server::bind(addr)
             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .unwrap();
