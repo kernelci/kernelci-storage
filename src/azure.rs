@@ -648,12 +648,17 @@ impl super::Driver for AzureDriver {
         });
         received_file
     }
-    fn list_files(&self, directory: String) -> Vec<String> {
-        let mut ret = Vec::new();
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            ret = rt.block_on(azure_list_files(directory));
-        });
-        ret
+    // Disabled: listing files on Azure Blob Storage is extremely slow due to
+    // the flat namespace requiring enumeration of all blobs with prefix filtering.
+    // For large containers this can take minutes and time out.
+    // The HTTP handler (ax_list_files) returns 403 Forbidden for Azure backends.
+    fn list_files(&self, _directory: String) -> Vec<String> {
+        // let mut ret = Vec::new();
+        // tokio::task::block_in_place(|| {
+        //     let rt = tokio::runtime::Runtime::new().unwrap();
+        //     ret = rt.block_on(azure_list_files(directory));
+        // });
+        // ret
+        Vec::new()
     }
 }

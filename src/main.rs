@@ -1222,6 +1222,11 @@ fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
 
 async fn ax_list_files() -> (StatusCode, String) {
     let driver_name = get_driver_type();
+    // Listing files is disabled for Azure backend because it is too slow
+    // (flat blob namespace requires enumerating all blobs with prefix filtering).
+    if driver_name == "azure" {
+        return (StatusCode::FORBIDDEN, "Listing files is disabled for Azure storage backend".to_string());
+    }
     let driver = init_driver(&driver_name);
     let files = driver.list_files("/".to_string());
     // generate nice list of files, with one file per line
