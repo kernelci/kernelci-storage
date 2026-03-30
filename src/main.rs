@@ -192,7 +192,7 @@ impl<'a> tokio::io::AsyncRead for FieldStream<'a> {
 
 #[async_trait]
 trait Driver: Send + Sync {
-    fn write_file(
+    async fn write_file(
         &self,
         filename: String,
         data: Vec<u8>,
@@ -206,13 +206,13 @@ trait Driver: Send + Sync {
         cont_type: String,
         owner_email: Option<String>,
     ) -> (String, usize);
-    fn get_file(&self, filename: String) -> ReceivedFile;
-    fn tag_file(
+    async fn get_file(&self, filename: String) -> ReceivedFile;
+    async fn tag_file(
         &self,
         filename: String,
         user_tags: Vec<(String, String)>,
     ) -> Result<String, String>;
-    fn list_files(&self, directory: String) -> Vec<String>;
+    async fn list_files(&self, directory: String) -> Vec<String>;
 }
 
 fn init_driver(driver_type: &str) -> Box<dyn Driver> {
@@ -984,7 +984,7 @@ async fn ax_get_file(
         };
 
     // IMPORTANT! Headers in cache must be stored in lowercase
-    let received_file = driver_get_file(filepath.clone());
+    let received_file = driver_get_file(filepath.clone()).await;
 
     // Release the semaphore now that the file is resolved
     drop(_permit);
@@ -1147,13 +1147,13 @@ async fn ax_get_file(
     }
 }
 
-fn driver_get_file(filepath: String) -> ReceivedFile {
+async fn driver_get_file(filepath: String) -> ReceivedFile {
     let driver_name = get_driver_type();
     let driver = init_driver(&driver_name);
-    driver.get_file(filepath)
+    driver.get_file(filepath).await
 }
 
-fn write_file_driver(
+async fn write_file_driver(
     filename: String,
     data: Vec<u8>,
     cont_type: String,
@@ -1161,7 +1161,7 @@ fn write_file_driver(
 ) -> String {
     let driver_name = get_driver_type();
     let driver = init_driver(&driver_name);
-    driver.write_file(filename, data, cont_type, owner_email);
+    driver.write_file(filename, data, cont_type, owner_email).await;
     "".to_string()
 }
 
@@ -1228,7 +1228,7 @@ async fn ax_list_files() -> (StatusCode, String) {
         return (StatusCode::FORBIDDEN, "Listing files is disabled for Azure storage backend".to_string());
     }
     let driver = init_driver(&driver_name);
-    let files = driver.list_files("/".to_string());
+    let files = driver.list_files("/".to_string()).await;
     // generate nice list of files, with one file per line
     let files_str = files.join("\n");
     (StatusCode::OK, files_str)
