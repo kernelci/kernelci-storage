@@ -600,7 +600,7 @@ async fn azure_list_files(directory: String) -> Vec<String> {
 /// Implement Driver trait for AzureDriver
 #[async_trait]
 impl super::Driver for AzureDriver {
-    fn write_file(
+    async fn write_file(
         &self,
         filename: String,
         data: Vec<u8>,
@@ -608,11 +608,7 @@ impl super::Driver for AzureDriver {
         owner_email: Option<String>,
     ) -> String {
         let filenameret = filename.clone();
-        /* Call async write_file_to_blob use tokio::task::block_in_place */
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(write_file_to_blob(filename, data, cont_type, owner_email));
-        });
+        write_file_to_blob(filename, data, cont_type, owner_email).await;
         filenameret
     }
     async fn write_file_streaming(
@@ -625,35 +621,21 @@ impl super::Driver for AzureDriver {
         let (_status, size) = write_file_to_blob_streaming(filename.clone(), data, cont_type, owner_email).await;
         (filename, size)
     }
-    fn tag_file(
+    async fn tag_file(
         &self,
         filename: String,
         user_tags: Vec<(String, String)>,
     ) -> Result<String, String> {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let ret = rt.block_on(azure_set_filename_tags(filename, user_tags));
-        ret
+        azure_set_filename_tags(filename, user_tags).await
     }
-    fn get_file(&self, filename: String) -> ReceivedFile {
-        /* Call async get_file_from_blob use tokio::task::block_in_place */
-        let mut received_file = ReceivedFile {
-            original_filename: "".to_string(),
-            cached_filename: "".to_string(),
-            headers: HeaderMap::new(),
-            valid: false,
-        };
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            received_file = rt.block_on(get_file_from_blob(filename));
-        });
-        received_file
+    async fn get_file(&self, filename: String) -> ReceivedFile {
+        get_file_from_blob(filename).await
     }
-    fn list_files(&self, directory: String) -> Vec<String> {
-        let mut ret = Vec::new();
-        tokio::task::block_in_place(|| {
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            ret = rt.block_on(azure_list_files(directory));
-        });
-        ret
+    // Disabled: listing files on Azure Blob Storage is extremely slow due to
+    // the flat namespace requiring enumeration of all blobs with prefix filtering.
+    // For large containers this can take minutes and time out.
+    // The HTTP handler (ax_list_files) returns 403 Forbidden for Azure backends.
+    async fn list_files(&self, _directory: String) -> Vec<String> {
+        Vec::new()
     }
 }

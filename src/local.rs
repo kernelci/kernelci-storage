@@ -326,17 +326,24 @@ fn set_tags_for_local_file(
 /// Implement Driver trait for LocalDriver
 #[async_trait]
 impl super::Driver for LocalDriver {
-    fn write_file(
+    async fn write_file(
         &self,
         filename: String,
         data: Vec<u8>,
         cont_type: String,
         owner_email: Option<String>,
     ) -> String {
-        match write_file_to_local(filename.clone(), data, cont_type, owner_email) {
-            Ok(_) => filename,
-            Err(e) => {
+        let fname = filename.clone();
+        match tokio::task::spawn_blocking(move || {
+            write_file_to_local(fname, data, cont_type, owner_email)
+        }).await {
+            Ok(Ok(_)) => filename,
+            Ok(Err(e)) => {
                 eprintln!("Local storage write error: {}", e);
+                String::new()
+            }
+            Err(e) => {
+                eprintln!("Local storage write task panicked: {}", e);
                 String::new()
             }
         }
@@ -358,19 +365,36 @@ impl super::Driver for LocalDriver {
         }
     }
 
-    fn get_file(&self, filename: String) -> ReceivedFile {
-        get_file_from_local(filename)
+    async fn get_file(&self, filename: String) -> ReceivedFile {
+        tokio::task::spawn_blocking(move || get_file_from_local(filename))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Local storage get_file task panicked: {}", e);
+                ReceivedFile {
+                    original_filename: String::new(),
+                    cached_filename: String::new(),
+                    headers: HeaderMap::new(),
+                    valid: false,
+                }
+            })
     }
 
-    fn tag_file(
+    async fn tag_file(
         &self,
         filename: String,
         user_tags: Vec<(String, String)>,
     ) -> Result<String, String> {
-        set_tags_for_local_file(filename, user_tags)
+        tokio::task::spawn_blocking(move || set_tags_for_local_file(filename, user_tags))
+            .await
+            .unwrap_or_else(|e| Err(format!("Local storage tag_file task panicked: {}", e)))
     }
 
-    fn list_files(&self, directory: String) -> Vec<String> {
-        list_files_in_local(directory)
+    async fn list_files(&self, directory: String) -> Vec<String> {
+        tokio::task::spawn_blocking(move || list_files_in_local(directory))
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Local storage list_files task panicked: {}", e);
+                Vec::new()
+            })
     }
 }
