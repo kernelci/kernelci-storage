@@ -66,7 +66,20 @@ fn ensure_directory_exists(file_path: &Path) -> Result<(), std::io::Error> {
 fn get_storage_file_path(filename: &str) -> PathBuf {
     let config = get_local_config();
     let storage_path = Path::new(&config.storage_path);
-    storage_path.join(filename)
+    // Strip leading slashes to ensure the path is always relative to storage root
+    let safe_name = filename.trim_start_matches('/');
+    let full = storage_path.join(safe_name);
+    // Defense-in-depth: verify resolved path stays within storage root
+    let canonical_storage = storage_path.canonicalize().unwrap_or_else(|_| storage_path.to_path_buf());
+    // Use the parent directory for canonicalization since the file may not exist yet
+    let parent = full.parent().unwrap_or(&full);
+    let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    if !canonical_parent.starts_with(&canonical_storage) {
+        // Fall back to storage root to prevent escape
+        storage_path.join(Path::new(safe_name).file_name().unwrap_or_default())
+    } else {
+        full
+    }
 }
 
 /// Get metadata file path for storing headers

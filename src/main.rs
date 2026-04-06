@@ -693,6 +693,8 @@ async fn ax_post_file(
                     } else {
                         format!("{}/{}", path, file0_filename)
                     };
+                    // Normalize: strip leading slashes so the path is always relative
+                    let full_path = full_path.trim_start_matches('/').to_string();
 
                     // validate path for traversal
                     match validate_path(&full_path) {
@@ -828,6 +830,8 @@ async fn ax_post_file(
             } else {
                 format!("{}/{}", path, file0_filename)
             };
+            // Normalize: strip leading slashes so the path is always relative
+            let full_path = full_path.trim_start_matches('/').to_string();
 
             match validate_path(&full_path) {
                 Ok(_) => (),
