@@ -688,7 +688,11 @@ async fn ax_post_file(
                         path.pop();
                     }
 
-                    let full_path = format!("{}/{}", path, file0_filename);
+                    let full_path = if path.is_empty() {
+                        file0_filename.clone()
+                    } else {
+                        format!("{}/{}", path, file0_filename)
+                    };
 
                     // validate path for traversal
                     match validate_path(&full_path) {
@@ -814,19 +818,16 @@ async fn ax_post_file(
     // Handle buffered file0 case (file0 arrived before path)
     if upload_result.is_none() {
         if let Some(tmp) = buffered_file {
-            if path.is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    b"Missing path field in upload".to_vec(),
-                );
-            }
-
             if path.ends_with("/") {
                 debug_log!("Removing trailing /, workaround");
                 path.pop();
             }
 
-            let full_path = format!("{}/{}", path, file0_filename);
+            let full_path = if path.is_empty() {
+                file0_filename.clone()
+            } else {
+                format!("{}/{}", path, file0_filename)
+            };
 
             match validate_path(&full_path) {
                 Ok(_) => (),
