@@ -513,6 +513,25 @@ fn validate_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Build a normalized, validated storage key from the upload path and filename.
+/// Strips trailing slashes from `path`, joins with `filename`, strips leading slashes,
+/// and validates against path traversal.
+fn build_storage_key(path: &mut String, filename: &str) -> Result<String, String> {
+    // Remove trailing slash
+    if path.ends_with('/') {
+        path.pop();
+    }
+    let full_path = if path.is_empty() {
+        filename.to_string()
+    } else {
+        format!("{}/{}", path, filename)
+    };
+    // Normalize: strip leading slashes so the path is always relative
+    let full_path = full_path.trim_start_matches('/').to_string();
+    validate_path(&full_path)?;
+    Ok(full_path)
+}
+
 fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
     let cfg_content = get_config_content();
     let cfg: Table = toml::from_str(&cfg_content).unwrap();
@@ -682,28 +701,13 @@ async fn ax_post_file(
                     }
 
                     // FAST PATH: path already set, stream directly
-                    // if path ends on /, remove it
-                    if path.ends_with("/") {
-                        debug_log!("Removing trailing /, workaround");
-                        path.pop();
-                    }
-
-                    let full_path = if path.is_empty() {
-                        file0_filename.clone()
-                    } else {
-                        format!("{}/{}", path, file0_filename)
-                    };
-                    // Normalize: strip leading slashes so the path is always relative
-                    let full_path = full_path.trim_start_matches('/').to_string();
-
-                    // validate path for traversal
-                    match validate_path(&full_path) {
-                        Ok(_) => (),
+                    let full_path = match build_storage_key(&mut path, &file0_filename) {
+                        Ok(p) => p,
                         Err(e) => {
                             upload_result = Some((StatusCode::BAD_REQUEST, e.into_bytes()));
                             break;
                         }
-                    }
+                    };
 
                     // verify upload permissions
                     match verify_upload_permissions(&owner, &path) {
@@ -820,25 +824,12 @@ async fn ax_post_file(
     // Handle buffered file0 case (file0 arrived before path)
     if upload_result.is_none() {
         if let Some(tmp) = buffered_file {
-            if path.ends_with("/") {
-                debug_log!("Removing trailing /, workaround");
-                path.pop();
-            }
-
-            let full_path = if path.is_empty() {
-                file0_filename.clone()
-            } else {
-                format!("{}/{}", path, file0_filename)
-            };
-            // Normalize: strip leading slashes so the path is always relative
-            let full_path = full_path.trim_start_matches('/').to_string();
-
-            match validate_path(&full_path) {
-                Ok(_) => (),
+            let full_path = match build_storage_key(&mut path, &file0_filename) {
+                Ok(p) => p,
                 Err(e) => {
                     return (StatusCode::BAD_REQUEST, e.into_bytes());
                 }
-            }
+            };
 
             match verify_upload_permissions(&owner, &path) {
                 Ok(_) => (),
