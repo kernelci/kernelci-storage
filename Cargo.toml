@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.7.9", features = ["tracing", "multipart", "macros"] }
-axum-server = { version = "0.7.1", features = ["rustls", "rustls-pemfile", "tls-rustls"] }
+axum-server = { version = "0.8.0", features = ["rustls", "rustls-pemfile", "tls-rustls"] }
 azure_blob_uploader = "0.1.4"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
