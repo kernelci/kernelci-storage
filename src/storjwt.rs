@@ -21,15 +21,18 @@ fn verify_with_key_str(
 pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt::Error> {
     let toml_cfg = get_config_content();
     let parsed_toml = toml_cfg.parse::<Table>().unwrap();
-    let key_str = parsed_toml["jwt_secret"].as_str().unwrap();
 
-    match verify_with_key_str(token_str, key_str) {
-        Ok(claims) => {
-            debug_log!("email: {}", claims["email"]);
-            return Ok(claims);
-        }
-        Err(e) => {
-            debug_log!("JWT verification with jwt_secret failed: {:?}", e);
+    // If only unified_secret is configured, it serves as jwt_secret as well.
+    // Try jwt_secret first, then fall through to unified_secret.
+    if let Some(key_str) = parsed_toml.get("jwt_secret").and_then(|v| v.as_str()) {
+        match verify_with_key_str(token_str, key_str) {
+            Ok(claims) => {
+                debug_log!("email: {}", claims["email"]);
+                return Ok(claims);
+            }
+            Err(e) => {
+                debug_log!("JWT verification with jwt_secret failed: {:?}", e);
+            }
         }
     }
 
@@ -64,7 +67,12 @@ pub fn generate_jwt_secret() {
 pub fn generate_jwt_token(email: &str) -> Result<String, jwt::Error> {
     let toml_cfg = get_config_content();
     let parsed_toml = toml_cfg.parse::<Table>().unwrap();
-    let key_str = parsed_toml["jwt_secret"].as_str().unwrap();
+    // For token generation, prefer jwt_secret, fall back to unified_secret
+    let key_str = parsed_toml
+        .get("jwt_secret")
+        .or_else(|| parsed_toml.get("unified_secret"))
+        .and_then(|v| v.as_str())
+        .expect("config must define jwt_secret or unified_secret");
     let key: Hmac<Sha256> = Hmac::new_from_slice(key_str.as_bytes())?;
     let mut claims = BTreeMap::new();
     claims.insert("email".to_string(), email.to_string());
