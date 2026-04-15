@@ -1,4 +1,4 @@
-use crate::{debug_log, get_config_content};
+use crate::get_config_content;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
@@ -325,7 +325,6 @@ pub async fn cache_loop(cache_dir: &str) {
     let cleanup_chunk_size = config.cleanup_chunk_size.max(1);
     let mut deleted_entries_counter: u64 = 0;
     let mut reclaimed_bytes_counter: u64 = 0;
-    let mut cached_file_count: usize = 0;
     let mut next_log = Instant::now();
 
     loop {
@@ -333,7 +332,7 @@ pub async fn cache_loop(cache_dir: &str) {
             enforce_cache_file_limit(cache_dir, cleanup_chunk_size).await;
         deleted_entries_counter += limit_outcome.deleted_entries;
         reclaimed_bytes_counter += limit_outcome.reclaimed_bytes;
-        cached_file_count = file_count;
+        let mut cached_file_count = file_count;
 
         let mut free_space = freediskspace_percent(cache_dir).await;
         if free_space < DISK_SPACE_LOW_PERCENT {

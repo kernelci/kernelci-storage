@@ -106,6 +106,7 @@ mod tests {
     }
 }
 
+#[allow(dead_code)]
 fn calculate_checksum(filename: &String, data: &[u8]) {
     let hash = sha2_512::default().update(data).finalize();
     let digest = hash.digest();
@@ -217,6 +218,7 @@ async fn write_file_to_blob_streaming(
 
 /// Write file to Azure blob storage (legacy version using Vec<u8>)
 /// TBD: Rework, do not keep whole file as Vec<u8> in memory!!!
+#[allow(dead_code)]
 async fn write_file_to_blob(
     filename: String,
     data: Vec<u8>,
@@ -378,7 +380,6 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     let blob_client = ClientBuilder::new(storage_account, storage_credential)
         .blob_client(storage_container, storage_blob);
     let blob_url_res = blob_client.url();
-    let mut blob_url = "".to_string();
     let mut received_file = ReceivedFile {
         original_filename: "".to_string(),
         cached_filename: "".to_string(),
@@ -387,16 +388,13 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     };
     received_file.original_filename = filename.clone();
 
-    match blob_url_res {
-        Ok(url) => {
-            //println!("Blob URL: {}", url);
-            blob_url = url.to_string();
-        }
+    let mut blob_url = match blob_url_res {
+        Ok(url) => url.to_string(),
         Err(e) => {
             eprintln!("Error getting blob URL: {:?}", e);
             return received_file;
         }
-    }
+    };
     // append SAS token to blob URL
     blob_url.push_str(storage_sastoken);
     // we generate a hash of the filename to use as cache filename
@@ -527,6 +525,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
 
 // Implement set tags for Azure blob storage
 // tags are in format "key=value"
+#[allow(dead_code)]
 async fn azure_set_filename_tags(
     filename: String,
     user_tags: Vec<(String, String)>,
@@ -571,7 +570,8 @@ async fn azure_set_filename_tags(
     }
 }
 
-async fn azure_list_files(directory: String) -> Vec<String> {
+#[allow(dead_code)]
+async fn azure_list_files(_directory: String) -> Vec<String> {
     let azure_cfg = Arc::new(get_azure_credentials("azure"));
     let storage_account = azure_cfg.account.as_str();
     let storage_key = azure_cfg.key.clone();
