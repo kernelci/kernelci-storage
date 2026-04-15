@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 async-trait = "0.1"
 axum = { version = "0.7.9", features = ["tracing", "multipart", "macros"] }
-axum-server = { version = "0.8.0", features = ["rustls", "rustls-pemfile", "tls-rustls"] }
+axum-server = { version = "0.8.0", features = ["rustls", "tls-rustls"] }
 azure_blob_uploader = "0.1.4"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
@@ -19,14 +19,12 @@ futures = "0.3.31"
 futures-util = "0.3.31"
 headers = "0.4.0"
 hex = "0.4.3"
-hmac = "0.13.0"
 http-body-util = "0.1.2"
-jwt = "0.16.0"
+jsonwebtoken = "10"
 rand = "0.8.5"
 reqwest = { version = "0.12.9", features = ["blocking"] }
 rustls = "0.23.20"
 serde = { version = "1.0.216", features = ["derive"] }
-sha2 = "0.11.0"
 sysinfo = { version = "0.35.2", features = ["serde"] }
 tempfile = "3.14.0"
 tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread", "macros"] }
@@ -39,8 +37,6 @@ tracing-subscriber = "0.3.19"
 
 [dev-dependencies]
 reqwest = { version = "0.12.9", features = ["blocking", "multipart"] }
-hmac = "0.13.0"
-jwt = "0.16.0"
-sha2 = "0.11.0"
+jsonwebtoken = "10"
 tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread", "macros", "time", "process"] }
 tempfile = "3.14.0"

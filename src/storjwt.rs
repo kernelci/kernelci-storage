@@ -1,24 +1,31 @@
 use crate::{debug_log, get_config_content};
-use hmac::{Hmac, Mac};
-use jwt::{Header, SignWithKey, Token, VerifyWithKey};
-use sha2::Sha256;
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use toml::value::Table;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    email: String,
+}
+
 fn verify_with_key_str(
     token_str: &str,
     key_str: &str,
-) -> Result<BTreeMap<String, String>, jwt::Error> {
-    let key: Hmac<Sha256> = Hmac::new_from_slice(key_str.as_bytes())?;
-    let token: Token<Header, BTreeMap<String, String>, _> = token_str.verify_with_key(&key)?;
-    let claims = token.claims();
-    if claims.get("email").is_none() {
-        debug_log!("email not found");
-        return Err(jwt::Error::InvalidSignature);
-    }
-    Ok(claims.clone())
+) -> Result<BTreeMap<String, String>, jsonwebtoken::errors::Error> {
+    let key = DecodingKey::from_secret(key_str.as_bytes());
+    let mut validation = Validation::default();
+    validation.required_spec_claims.clear();
+    validation.validate_exp = false;
+    let token_data = decode::<Claims>(token_str, &key, &validation)?;
+    let mut claims = BTreeMap::new();
+    claims.insert("email".to_string(), token_data.claims.email);
+    Ok(claims)
 }
 
-pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt::Error> {
+pub fn verify_jwt_token(
+    token_str: &str,
+) -> Result<BTreeMap<String, String>, jsonwebtoken::errors::Error> {
     let toml_cfg = get_config_content();
     let parsed_toml = toml_cfg.parse::<Table>().unwrap();
 
@@ -49,7 +56,7 @@ pub fn verify_jwt_token(token_str: &str) -> Result<BTreeMap<String, String>, jwt
         }
     }
 
-    Err(jwt::Error::InvalidSignature)
+    Err(jsonwebtoken::errors::ErrorKind::InvalidSignature.into())
 }
 
 pub fn generate_jwt_secret() {
@@ -64,7 +71,7 @@ pub fn generate_jwt_secret() {
     debug_log!("jwt_secret=\"{}\"", secret);
 }
 
-pub fn generate_jwt_token(email: &str) -> Result<String, jwt::Error> {
+pub fn generate_jwt_token(email: &str) -> Result<String, jsonwebtoken::errors::Error> {
     let toml_cfg = get_config_content();
     let parsed_toml = toml_cfg.parse::<Table>().unwrap();
     // For token generation, prefer jwt_secret, fall back to unified_secret
@@ -73,9 +80,9 @@ pub fn generate_jwt_token(email: &str) -> Result<String, jwt::Error> {
         .or_else(|| parsed_toml.get("unified_secret"))
         .and_then(|v| v.as_str())
         .expect("config must define jwt_secret or unified_secret");
-    let key: Hmac<Sha256> = Hmac::new_from_slice(key_str.as_bytes())?;
-    let mut claims = BTreeMap::new();
-    claims.insert("email".to_string(), email.to_string());
-    let token_str = claims.sign_with_key(&key)?;
-    Ok(token_str)
+    let key = EncodingKey::from_secret(key_str.as_bytes());
+    let claims = Claims {
+        email: email.to_string(),
+    };
+    encode(&Header::default(), &claims, &key)
 }
