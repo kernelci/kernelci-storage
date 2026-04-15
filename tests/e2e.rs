@@ -4,11 +4,9 @@
 // End-to-end tests for kernelci-storage using the local storage driver.
 // These tests start the actual server binary and exercise the HTTP API.
 
-use hmac::{Hmac, Mac};
-use jwt::SignWithKey;
+use jsonwebtoken::{encode, EncodingKey, Header};
 use reqwest::blocking::multipart;
-use sha2::Sha256;
-use std::collections::BTreeMap;
+use serde::Serialize;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -18,6 +16,11 @@ const JWT_SECRET: &str = "test-secret-for-e2e-testing";
 const TEST_EMAIL: &str = "test@kernelci.org";
 const RESTRICTED_EMAIL: &str = "restricted@kernelci.org";
 
+#[derive(Serialize)]
+struct Claims {
+    email: String,
+}
+
 /// Find an available TCP port
 fn get_free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("Failed to bind to ephemeral port");
@@ -26,10 +29,11 @@ fn get_free_port() -> u16 {
 
 /// Generate a JWT token for the given email using the test secret
 fn generate_token(email: &str) -> String {
-    let key: Hmac<Sha256> = Hmac::new_from_slice(JWT_SECRET.as_bytes()).unwrap();
-    let mut claims = BTreeMap::new();
-    claims.insert("email".to_string(), email.to_string());
-    claims.sign_with_key(&key).unwrap()
+    let key = EncodingKey::from_secret(JWT_SECRET.as_bytes());
+    let claims = Claims {
+        email: email.to_string(),
+    };
+    encode(&Header::default(), &claims, &key).unwrap()
 }
 
 /// Test server handle - kills the server process on drop

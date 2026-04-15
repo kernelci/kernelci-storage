@@ -100,6 +100,7 @@ fn get_metadata_file_path(filename: &str) -> PathBuf {
 }
 
 /// Calculate SHA-512 checksum of file data
+#[allow(dead_code)]
 fn calculate_checksum(filename: &str, data: &[u8]) {
     let hash = sha2_512::default().update(data).finalize();
     let digest = hash.digest();
@@ -157,6 +158,7 @@ async fn write_file_to_local_streaming(
 }
 
 /// Write file to local storage (legacy version using Vec<u8>)
+#[allow(dead_code)]
 fn write_file_to_local(
     filename: String,
     data: Vec<u8>,
@@ -298,6 +300,7 @@ fn list_files_in_local(directory: String) -> Vec<String> {
 }
 
 /// Set tags for local storage (stored in metadata)
+#[allow(dead_code)]
 fn set_tags_for_local_file(
     filename: String,
     user_tags: Vec<(String, String)>,

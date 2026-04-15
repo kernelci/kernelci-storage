@@ -190,6 +190,7 @@ impl<'a> tokio::io::AsyncRead for FieldStream<'a> {
     }
 }
 
+#[allow(dead_code)]
 #[async_trait]
 trait Driver: Send + Sync {
     async fn write_file(
@@ -1149,6 +1150,7 @@ async fn driver_get_file(filepath: String) -> ReceivedFile {
     driver.get_file(filepath).await
 }
 
+#[allow(dead_code)]
 async fn write_file_driver(
     filename: String,
     data: Vec<u8>,
