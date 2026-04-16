@@ -17,6 +17,7 @@ fn verify_with_key_str(
     let mut validation = Validation::default();
     validation.required_spec_claims.clear();
     validation.validate_exp = false;
+    validation.validate_aud = false;
     let token_data = decode::<Claims>(token_str, &key, &validation)?;
     let mut claims = BTreeMap::new();
     claims.insert("email".to_string(), token_data.claims.email);
