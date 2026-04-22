@@ -25,7 +25,7 @@ rand = "0.8.5"
 reqwest = { version = "0.12.9", features = ["blocking"] }
 rustls = "0.23.20"
 serde = { version = "1.0.216", features = ["derive"] }
-sysinfo = { version = "0.35.2", features = ["serde"] }
+sysinfo = { version = "0.38.4", features = ["serde"] }
 tempfile = "3.14.0"
 tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread", "macros"] }
 tokio-util = "0.7.13"
