@@ -21,7 +21,7 @@ headers = "0.4.0"
 hex = "0.4.3"
 http-body-util = "0.1.2"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
-rand = "0.8.5"
+rand = "0.10.1"
 reqwest = { version = "0.12.9", features = ["blocking"] }
 rustls = "0.23.20"
 serde = { version = "1.0.216", features = ["derive"] }
