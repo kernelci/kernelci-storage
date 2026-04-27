@@ -39,9 +39,11 @@ pub fn verify_jwt_token(
                 return Ok(claims);
             }
             Err(e) => {
-                debug_log!("JWT verification with jwt_secret failed: {:?}", e);
+                eprintln!("JWT verification with jwt_secret failed: {:?}", e);
             }
         }
+    } else {
+        eprintln!("No jwt_secret configured");
     }
 
     if let Some(unified) = parsed_toml.get("unified_secret").and_then(|v| v.as_str()) {
@@ -55,8 +57,11 @@ pub fn verify_jwt_token(
                 return Err(e);
             }
         }
+    } else {
+        eprintln!("No unified_secret configured");
     }
 
+    eprintln!("JWT verification error: no matching secret found");
     Err(jsonwebtoken::errors::ErrorKind::InvalidSignature.into())
 }
 
