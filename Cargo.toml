@@ -22,7 +22,7 @@ hex = "0.4.3"
 http-body-util = "0.1.2"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 rand = "0.8.5"
-reqwest = { version = "0.12.9", features = ["blocking"] }
+reqwest = { version = "0.13.3", features = ["blocking"] }
 rustls = "0.23.20"
 serde = { version = "1.0.216", features = ["derive"] }
 sysinfo = { version = "0.35.2", features = ["serde"] }
@@ -36,7 +36,7 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 
 [dev-dependencies]
-reqwest = { version = "0.12.9", features = ["blocking", "multipart"] }
+reqwest = { version = "0.13.3", features = ["blocking", "multipart"] }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 tokio = { version = "1.42.0", features = ["rt", "rt-multi-thread", "macros", "time", "process"] }
 tempfile = "3.14.0"
