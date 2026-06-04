@@ -17,6 +17,7 @@ mod logging;
 mod storcaching;
 mod storjwt;
 
+use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{ConnectInfo, DefaultBodyLimit, Multipart, OriginalUri, Path, State},
@@ -25,9 +26,8 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use bytes::Bytes;
-use async_trait::async_trait;
 use axum_server::tls_rustls::RustlsConfig;
+use bytes::Bytes;
 use clap::Parser;
 use headers::HeaderMap;
 use std::path;
@@ -35,15 +35,15 @@ use std::sync::OnceLock;
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-use std::{collections::HashMap, sync::Arc};
+use futures::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::{collections::HashMap, sync::Arc};
 use sysinfo::Disks;
 use tokio::sync::{RwLock, Semaphore};
 use tokio_util::io::ReaderStream;
 use toml::Table;
 use tower::ServiceBuilder;
-use futures::Future;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -80,7 +80,7 @@ struct Args {
 static ARGS: OnceLock<Args> = OnceLock::new();
 
 fn get_args() -> &'static Args {
-    ARGS.get_or_init(|| Args::parse())
+    ARGS.get_or_init(Args::parse)
 }
 
 // const names for last-modified and etag in lowercase
@@ -182,9 +182,7 @@ impl<'a> tokio::io::AsyncRead for FieldStream<'a> {
                 // EOF
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => {
-                Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::Other, e)))
-            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -420,7 +418,7 @@ async fn main() {
         .route("/v1/checkauth", get(ax_check_auth))
         .route("/v1/file", post(ax_post_file))
         .route("/upload", post(ax_post_file))
-        .route("/*filepath", get(ax_get_file))
+        .route("/{*filepath}", get(ax_get_file))
         .route("/v1/list", get(ax_list_files))
         .route("/metrics", get(ax_metrics))
         .layer(ServiceBuilder::new().layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 4)))
@@ -607,7 +605,10 @@ async fn ax_post_file(
         Ok(field) => field,
         Err(e) => {
             eprintln!("Error reading multipart field: {:?}", e);
-            return (StatusCode::BAD_REQUEST, b"Malformed multipart request".to_vec());
+            return (
+                StatusCode::BAD_REQUEST,
+                b"Malformed multipart request".to_vec(),
+            );
         }
     } {
         let name = match field.name() {
@@ -714,7 +715,8 @@ async fn ax_post_file(
                     match verify_upload_permissions(&owner, &path) {
                         Ok(_) => (),
                         Err(e) => {
-                            upload_result = Some((StatusCode::FORBIDDEN, e.to_string().into_bytes()));
+                            upload_result =
+                                Some((StatusCode::FORBIDDEN, e.to_string().into_bytes()));
                             break;
                         }
                     }
@@ -765,12 +767,14 @@ async fn ax_post_file(
                     let driver_name = get_driver_type();
                     let driver = init_driver(&driver_name);
 
-                    let (result, file_size) = driver.write_file_streaming(
-                        full_path.clone(),
-                        &mut field_stream,
-                        content_type.to_string(),
-                        Some(owner.clone()),
-                    ).await;
+                    let (result, file_size) = driver
+                        .write_file_streaming(
+                            full_path.clone(),
+                            &mut field_stream,
+                            content_type.to_string(),
+                            Some(owner.clone()),
+                        )
+                        .await;
 
                     if result.is_empty() {
                         upload_result = Some((StatusCode::CONFLICT, Vec::new()));
@@ -925,7 +929,10 @@ async fn ax_post_file(
 
     // If we get here, something went wrong (no file0 field found)
     debug_log!("No file0 field found in multipart upload");
-    (StatusCode::BAD_REQUEST, b"No file0 field in upload".to_vec())
+    (
+        StatusCode::BAD_REQUEST,
+        b"No file0 field in upload".to_vec(),
+    )
 }
 
 fn filename_from_fullpath(filepath: &str) -> String {
@@ -1077,7 +1084,8 @@ async fn ax_get_file(
                 match range.to_str().ok().and_then(parse_range) {
                     Some(parsed) => (start, end) = parsed,
                     None => {
-                        return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header").into_response();
+                        return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header")
+                            .into_response();
                     }
                 }
             }
@@ -1120,18 +1128,19 @@ async fn ax_get_file(
                     "{} 206 {} {} {} {} {}",
                     client_ip, body_size, human_time, method, filepath, user_agent_str
                 );
-                return (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response();
+                (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response()
+            } else {
+                println!(
+                    "{} 200 {} {} {} {} {}",
+                    client_ip,
+                    metadata.len(),
+                    human_time,
+                    method,
+                    filepath,
+                    user_agent_str
+                );
+                (StatusCode::OK, headers, axbody).into_response()
             }
-            println!(
-                "{} 200 {} {} {} {} {}",
-                client_ip,
-                metadata.len(),
-                human_time,
-                method,
-                filepath,
-                user_agent_str
-            );
-            return (StatusCode::OK, headers, axbody).into_response();
         }
         Err(_) => {
             eprintln!("Error opening file in ax_get_file");
@@ -1159,7 +1168,9 @@ async fn write_file_driver(
 ) -> String {
     let driver_name = get_driver_type();
     let driver = init_driver(&driver_name);
-    driver.write_file(filename, data, cont_type, owner_email).await;
+    driver
+        .write_file(filename, data, cont_type, owner_email)
+        .await;
     "".to_string()
 }
 
@@ -1223,7 +1234,10 @@ async fn ax_list_files() -> (StatusCode, String) {
     // Listing files is disabled for Azure backend because it is too slow
     // (flat blob namespace requires enumerating all blobs with prefix filtering).
     if driver_name == "azure" {
-        return (StatusCode::FORBIDDEN, "Listing files is disabled for Azure storage backend".to_string());
+        return (
+            StatusCode::FORBIDDEN,
+            "Listing files is disabled for Azure storage backend".to_string(),
+        );
     }
     let driver = init_driver(&driver_name);
     let files = driver.list_files("/".to_string()).await;

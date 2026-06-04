@@ -83,29 +83,6 @@ fn get_azure_credentials(name: &str) -> AzureConfig {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::normalize_sas_token;
-
-    #[test]
-    fn sas_token_is_left_empty() {
-        assert_eq!(normalize_sas_token(""), "");
-        assert_eq!(normalize_sas_token("   "), "");
-    }
-
-    #[test]
-    fn sas_token_is_left_intact_when_prefixed() {
-        assert_eq!(normalize_sas_token("?sv=1"), "?sv=1");
-        assert_eq!(normalize_sas_token(" ?sv=1 "), "?sv=1");
-    }
-
-    #[test]
-    fn sas_token_is_prefixed_when_missing_question_mark() {
-        assert_eq!(normalize_sas_token("sv=1"), "?sv=1");
-        assert_eq!(normalize_sas_token(" sv=1 "), "?sv=1");
-    }
-}
-
 #[allow(dead_code)]
 fn calculate_checksum(filename: &String, data: &[u8]) {
     let hash = sha2_512::default().update(data).finalize();
@@ -618,7 +595,8 @@ impl super::Driver for AzureDriver {
         cont_type: String,
         owner_email: Option<String>,
     ) -> (String, usize) {
-        let (_status, size) = write_file_to_blob_streaming(filename.clone(), data, cont_type, owner_email).await;
+        let (_status, size) =
+            write_file_to_blob_streaming(filename.clone(), data, cont_type, owner_email).await;
         (filename, size)
     }
     async fn tag_file(
@@ -637,5 +615,28 @@ impl super::Driver for AzureDriver {
     // The HTTP handler (ax_list_files) returns 403 Forbidden for Azure backends.
     async fn list_files(&self, _directory: String) -> Vec<String> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sas_token;
+
+    #[test]
+    fn sas_token_is_left_empty() {
+        assert_eq!(normalize_sas_token(""), "");
+        assert_eq!(normalize_sas_token("   "), "");
+    }
+
+    #[test]
+    fn sas_token_is_left_intact_when_prefixed() {
+        assert_eq!(normalize_sas_token("?sv=1"), "?sv=1");
+        assert_eq!(normalize_sas_token(" ?sv=1 "), "?sv=1");
+    }
+
+    #[test]
+    fn sas_token_is_prefixed_when_missing_question_mark() {
+        assert_eq!(normalize_sas_token("sv=1"), "?sv=1");
+        assert_eq!(normalize_sas_token(" sv=1 "), "?sv=1");
     }
 }
