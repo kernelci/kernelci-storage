@@ -26,9 +26,11 @@ fn verify_with_key_str(
 
 pub fn verify_jwt_token(
     token_str: &str,
+    client_info: &str,
 ) -> Result<BTreeMap<String, String>, jsonwebtoken::errors::Error> {
     let toml_cfg = get_config_content();
     let parsed_toml = toml_cfg.parse::<Table>().unwrap();
+    let human_time = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now());
 
     // If only unified_secret is configured, it serves as jwt_secret as well.
     // Try jwt_secret first, then fall through to unified_secret.
@@ -39,11 +41,14 @@ pub fn verify_jwt_token(
                 return Ok(claims);
             }
             Err(e) => {
-                eprintln!("JWT verification with jwt_secret failed: {:?}", e);
+                eprintln!(
+                    "{} JWT verification with jwt_secret failed: {:?} {}",
+                    human_time, e, client_info
+                );
             }
         }
     } else {
-        eprintln!("No jwt_secret configured");
+        eprintln!("{} No jwt_secret configured {}", human_time, client_info);
     }
 
     if let Some(unified) = parsed_toml.get("unified_secret").and_then(|v| v.as_str()) {
@@ -53,15 +58,21 @@ pub fn verify_jwt_token(
                 return Ok(claims);
             }
             Err(e) => {
-                eprintln!("JWT verification with unified_secret also failed: {:?}", e);
+                eprintln!(
+                    "{} JWT verification with unified_secret also failed: {:?} {}",
+                    human_time, e, client_info
+                );
                 return Err(e);
             }
         }
     } else {
-        eprintln!("No unified_secret configured");
+        eprintln!("{} No unified_secret configured {}", human_time, client_info);
     }
 
-    eprintln!("JWT verification error: no matching secret found");
+    eprintln!(
+        "{} JWT verification error: no matching secret found {}",
+        human_time, client_info
+    );
     Err(jsonwebtoken::errors::ErrorKind::InvalidSignature.into())
 }
 

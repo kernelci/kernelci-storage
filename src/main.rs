@@ -460,8 +460,12 @@ async fn get_favicon() -> (StatusCode, &'static str) {
 
 /// Check if the Authorization header is present and if the token is correct    
 /// Test it by: curl -X GET http://localhost:3000/v1/checkauth -H "Authorization: Bearer SuperSecretToken"
-async fn ax_check_auth(headers: HeaderMap) -> (StatusCode, String) {
-    let message = verify_auth_hdr(&headers);
+async fn ax_check_auth(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> (StatusCode, String) {
+    let client_info = client_info_str(&headers, remote_addr);
+    let message = verify_auth_hdr(&headers, &client_info);
 
     match message {
         Ok(email) => {
@@ -577,7 +581,8 @@ async fn ax_post_file(
     mut multipart: Multipart,
 ) -> (StatusCode, Vec<u8>) {
     // call check_auth
-    let message = verify_auth_hdr(&headers);
+    let client_info = client_info_str(&headers, remote_addr);
+    let message = verify_auth_hdr(&headers, &client_info);
     let owner = match message {
         Ok(owner) => owner,
         Err(_) => return (StatusCode::UNAUTHORIZED, Vec::new()),
@@ -1184,27 +1189,44 @@ fn parse_range(range: &str) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
+/// Build a "ip=... ua=..." string for auth log lines
+fn client_info_str(headers: &HeaderMap, fallback: SocketAddr) -> String {
+    let client_ip = client_ip_from_headers(headers, fallback);
+    let user_agent = headers
+        .get("User-Agent")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    format!("ip={} ua=\"{}\"", client_ip, user_agent)
+}
+
 /// Verify the Authorization header
 /// Return error message + owner if the token is correct
-fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
+fn verify_auth_hdr(headers: &HeaderMap, client_info: &str) -> Result<String, Option<String>> {
     let auth = match headers.get("Authorization") {
         Some(auth) => auth,
-        None => return Err(None),
+        None => {
+            eprintln!("Missing Authorization header {}", client_info);
+            return Err(None);
+        }
     };
     let auth_str = match auth.to_str() {
         Ok(s) => s,
-        Err(_) => return Err(None),
+        Err(_) => {
+            eprintln!("Invalid Authorization header {}", client_info);
+            return Err(None);
+        }
     };
     let token_parts: Vec<&str> = auth_str.split_whitespace().collect();
     if token_parts.is_empty() {
+        eprintln!("Empty Authorization header {}", client_info);
         return Err(None);
     }
     if token_parts.len() != 2 {
-        let verif_result = storjwt::verify_jwt_token(token_parts[0]);
+        let verif_result = storjwt::verify_jwt_token(token_parts[0], client_info);
         let bmap = match verif_result {
             Ok(bmap) => bmap.clone(),
             Err(_) => {
-                eprintln!("Error verifying token");
+                eprintln!("Error verifying token {}", client_info);
                 return Err(None);
             }
         };
@@ -1214,11 +1236,11 @@ fn verify_auth_hdr(headers: &HeaderMap) -> Result<String, Option<String>> {
             return Err(None);
         }
     }
-    let verif_result = storjwt::verify_jwt_token(token_parts[1]);
+    let verif_result = storjwt::verify_jwt_token(token_parts[1], client_info);
     let bmap = match verif_result {
         Ok(bmap) => bmap.clone(),
         Err(_) => {
-            eprintln!("Error verifying bearer token");
+            eprintln!("Error verifying bearer token {}", client_info);
             return Err(None);
         }
     };
