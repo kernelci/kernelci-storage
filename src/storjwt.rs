@@ -67,13 +67,9 @@ pub fn verify_jwt_token(
 
 pub fn generate_jwt_secret() {
     // generate a random 32 bytes alphanumeric string
-    use rand::{distributions::Alphanumeric, Rng};
+    use rand::distr::{Alphanumeric, SampleString};
 
-    let secret: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(32)
-        .map(char::from)
-        .collect();
+    let secret = Alphanumeric.sample_string(&mut rand::rng(), 32);
     debug_log!("jwt_secret=\"{}\"", secret);
 }
 

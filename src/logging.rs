@@ -23,8 +23,8 @@ pub fn verbose_enabled() -> bool {
 }
 
 fn env_verbose_enabled() -> bool {
-    std::env::var(ENV_DEBUG).map_or(false, |v| !v.is_empty())
-        || std::env::var(ENV_VERBOSE).map_or(false, |v| !v.is_empty())
+    std::env::var(ENV_DEBUG).is_ok_and(|v| !v.is_empty())
+        || std::env::var(ENV_VERBOSE).is_ok_and(|v| !v.is_empty())
 }
 
 #[macro_export]

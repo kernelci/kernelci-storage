@@ -70,10 +70,14 @@ fn get_storage_file_path(filename: &str) -> PathBuf {
     let safe_name = filename.trim_start_matches('/');
     let full = storage_path.join(safe_name);
     // Defense-in-depth: verify resolved path stays within storage root
-    let canonical_storage = storage_path.canonicalize().unwrap_or_else(|_| storage_path.to_path_buf());
+    let canonical_storage = storage_path
+        .canonicalize()
+        .unwrap_or_else(|_| storage_path.to_path_buf());
     // Use the parent directory for canonicalization since the file may not exist yet
     let parent = full.parent().unwrap_or(&full);
-    let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let canonical_parent = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     if !canonical_parent.starts_with(&canonical_storage) {
         // Fall back to storage root to prevent escape
         storage_path.join(Path::new(safe_name).file_name().unwrap_or_default())
@@ -265,26 +269,24 @@ fn list_files_in_local(directory: String) -> Vec<String> {
 
     fn collect_files_recursive(path: &Path, base_path: &Path, files: &mut Vec<String>) {
         if let Ok(entries) = fs::read_dir(path) {
-            for entry in entries {
-                if let Ok(entry) = entry {
-                    let entry_path = entry.path();
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
 
-                    // Skip metadata directory
-                    if entry_path
-                        .file_name()
-                        .map_or(false, |name| name == ".metadata")
-                    {
-                        continue;
-                    }
+                // Skip metadata directory
+                if entry_path
+                    .file_name()
+                    .is_some_and(|name| name == ".metadata")
+                {
+                    continue;
+                }
 
-                    if entry_path.is_file() {
-                        // Get relative path from storage root
-                        if let Ok(relative_path) = entry_path.strip_prefix(base_path) {
-                            files.push(relative_path.to_string_lossy().to_string());
-                        }
-                    } else if entry_path.is_dir() {
-                        collect_files_recursive(&entry_path, base_path, files);
+                if entry_path.is_file() {
+                    // Get relative path from storage root
+                    if let Ok(relative_path) = entry_path.strip_prefix(base_path) {
+                        files.push(relative_path.to_string_lossy().to_string());
                     }
+                } else if entry_path.is_dir() {
+                    collect_files_recursive(&entry_path, base_path, files);
                 }
             }
         }
@@ -352,7 +354,9 @@ impl super::Driver for LocalDriver {
         let fname = filename.clone();
         match tokio::task::spawn_blocking(move || {
             write_file_to_local(fname, data, cont_type, owner_email)
-        }).await {
+        })
+        .await
+        {
             Ok(Ok(_)) => filename,
             Ok(Err(e)) => {
                 eprintln!("Local storage write error: {}", e);

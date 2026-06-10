@@ -122,14 +122,21 @@ cleanup_chunk_size=100000
     fn wait_until_ready(&self) {
         let client = reqwest::blocking::Client::new();
         for _ in 0..50 {
-            if let Ok(resp) = client.get(&self.base_url).timeout(Duration::from_millis(200)).send() {
+            if let Ok(resp) = client
+                .get(&self.base_url)
+                .timeout(Duration::from_millis(200))
+                .send()
+            {
                 if resp.status().is_success() {
                     return;
                 }
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        panic!("Server did not become ready within 5 seconds on port {}", self.port);
+        panic!(
+            "Server did not become ready within 5 seconds on port {}",
+            self.port
+        );
     }
 
     fn url(&self, path: &str) -> String {
@@ -157,7 +164,7 @@ impl Drop for TestServer {
 #[test]
 fn test_root_endpoint() {
     let server = TestServer::start();
-    let resp = server.client().get(&server.url("/")).send().unwrap();
+    let resp = server.client().get(server.url("/")).send().unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.text().unwrap(), "KernelCI Storage Server");
 }
@@ -168,14 +175,22 @@ fn test_checkauth_valid_token() {
     let token = generate_token(TEST_EMAIL);
     let resp = server
         .client()
-        .get(&server.url("/v1/checkauth"))
+        .get(server.url("/v1/checkauth"))
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().unwrap();
-    assert!(body.contains("Authorized"), "Expected 'Authorized' in body, got: {}", body);
-    assert!(body.contains(TEST_EMAIL), "Expected email in body, got: {}", body);
+    assert!(
+        body.contains("Authorized"),
+        "Expected 'Authorized' in body, got: {}",
+        body
+    );
+    assert!(
+        body.contains(TEST_EMAIL),
+        "Expected email in body, got: {}",
+        body
+    );
 }
 
 #[test]
@@ -183,7 +198,7 @@ fn test_checkauth_no_token() {
     let server = TestServer::start();
     let resp = server
         .client()
-        .get(&server.url("/v1/checkauth"))
+        .get(server.url("/v1/checkauth"))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 401);
@@ -194,7 +209,7 @@ fn test_checkauth_invalid_token() {
     let server = TestServer::start();
     let resp = server
         .client()
-        .get(&server.url("/v1/checkauth"))
+        .get(server.url("/v1/checkauth"))
         .header("Authorization", "Bearer invalid-token-value")
         .send()
         .unwrap();
@@ -210,18 +225,16 @@ fn test_upload_and_download() {
     let file_content = b"Hello, KernelCI storage e2e test!";
 
     // Upload
-    let form = multipart::Form::new()
-        .text("path", "testdir")
-        .part(
-            "file0",
-            multipart::Part::bytes(file_content.to_vec())
-                .file_name("hello.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "testdir").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("hello.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
 
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -229,7 +242,7 @@ fn test_upload_and_download() {
     assert_eq!(resp.status(), 200, "Upload failed: {:?}", resp.text());
 
     // Download
-    let resp = client.get(&server.url("/testdir/hello.txt")).send().unwrap();
+    let resp = client.get(server.url("/testdir/hello.txt")).send().unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().unwrap();
     assert_eq!(body.as_ref(), file_content);
@@ -242,18 +255,16 @@ fn test_upload_via_legacy_endpoint() {
     let client = server.client();
 
     let file_content = b"legacy upload test";
-    let form = multipart::Form::new()
-        .text("path", "legacy")
-        .part(
-            "file0",
-            multipart::Part::bytes(file_content.to_vec())
-                .file_name("test.bin")
-                .mime_str("application/octet-stream")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "legacy").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("test.bin")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
 
     let resp = client
-        .post(&server.url("/upload"))
+        .post(server.url("/upload"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -261,7 +272,7 @@ fn test_upload_via_legacy_endpoint() {
     assert_eq!(resp.status(), 200);
 
     // Verify download works
-    let resp = client.get(&server.url("/legacy/test.bin")).send().unwrap();
+    let resp = client.get(server.url("/legacy/test.bin")).send().unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().unwrap().as_ref(), file_content);
 }
@@ -271,18 +282,16 @@ fn test_upload_unauthorized() {
     let server = TestServer::start();
     let client = server.client();
 
-    let form = multipart::Form::new()
-        .text("path", "testdir")
-        .part(
-            "file0",
-            multipart::Part::bytes(b"should fail".to_vec())
-                .file_name("fail.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "testdir").part(
+        "file0",
+        multipart::Part::bytes(b"should fail".to_vec())
+            .file_name("fail.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
 
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .multipart(form)
         .send()
         .unwrap();
@@ -296,18 +305,16 @@ fn test_upload_permission_denied() {
     let client = server.client();
 
     // restricted@kernelci.org can only upload to "restricted-area" prefix
-    let form = multipart::Form::new()
-        .text("path", "other-dir")
-        .part(
-            "file0",
-            multipart::Part::bytes(b"should be forbidden".to_vec())
-                .file_name("forbidden.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "other-dir").part(
+        "file0",
+        multipart::Part::bytes(b"should be forbidden".to_vec())
+            .file_name("forbidden.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
 
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -333,12 +340,17 @@ fn test_upload_permission_allowed_prefix() {
         );
 
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 200, "Upload should be allowed: {:?}", resp.text());
+    assert_eq!(
+        resp.status(),
+        200,
+        "Upload should be allowed: {:?}",
+        resp.text()
+    );
 }
 
 #[test]
@@ -346,7 +358,7 @@ fn test_download_not_found() {
     let server = TestServer::start();
     let resp = server
         .client()
-        .get(&server.url("/nonexistent/file.txt"))
+        .get(server.url("/nonexistent/file.txt"))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 404);
@@ -364,18 +376,16 @@ fn test_list_files() {
         ("list-test", "file2.txt", "content2"),
         ("list-test/sub", "file3.txt", "content3"),
     ] {
-        let form = multipart::Form::new()
-            .text("path", path.to_string())
-            .part(
-                "file0",
-                multipart::Part::bytes(content.as_bytes().to_vec())
-                    .file_name(name.to_string())
-                    .mime_str("text/plain")
-                    .unwrap(),
-            );
+        let form = multipart::Form::new().text("path", path.to_string()).part(
+            "file0",
+            multipart::Part::bytes(content.as_bytes().to_vec())
+                .file_name(name.to_string())
+                .mime_str("text/plain")
+                .unwrap(),
+        );
 
         let resp = client
-            .post(&server.url("/v1/file"))
+            .post(server.url("/v1/file"))
             .header("Authorization", format!("Bearer {}", token))
             .multipart(form)
             .send()
@@ -384,12 +394,24 @@ fn test_list_files() {
     }
 
     // List files
-    let resp = client.get(&server.url("/v1/list")).send().unwrap();
+    let resp = client.get(server.url("/v1/list")).send().unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().unwrap();
-    assert!(body.contains("list-test/file1.txt"), "Missing file1.txt in list: {}", body);
-    assert!(body.contains("list-test/file2.txt"), "Missing file2.txt in list: {}", body);
-    assert!(body.contains("list-test/sub/file3.txt"), "Missing file3.txt in list: {}", body);
+    assert!(
+        body.contains("list-test/file1.txt"),
+        "Missing file1.txt in list: {}",
+        body
+    );
+    assert!(
+        body.contains("list-test/file2.txt"),
+        "Missing file2.txt in list: {}",
+        body
+    );
+    assert!(
+        body.contains("list-test/sub/file3.txt"),
+        "Missing file3.txt in list: {}",
+        body
+    );
 }
 
 #[test]
@@ -401,17 +423,15 @@ fn test_range_request() {
     let file_content = b"0123456789ABCDEF";
 
     // Upload
-    let form = multipart::Form::new()
-        .text("path", "range-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(file_content.to_vec())
-                .file_name("data.bin")
-                .mime_str("application/octet-stream")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "range-test").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("data.bin")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -420,11 +440,16 @@ fn test_range_request() {
 
     // Range request: bytes 5 onwards
     let resp = client
-        .get(&server.url("/range-test/data.bin"))
+        .get(server.url("/range-test/data.bin"))
         .header("Range", "bytes=5-")
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 206, "Expected 206 Partial Content, got {}", resp.status());
+    assert_eq!(
+        resp.status(),
+        206,
+        "Expected 206 Partial Content, got {}",
+        resp.status()
+    );
     let body = resp.bytes().unwrap();
     assert_eq!(body.as_ref(), &file_content[5..]);
 }
@@ -438,17 +463,15 @@ fn test_head_request() {
     let file_content = b"head request test content";
 
     // Upload
-    let form = multipart::Form::new()
-        .text("path", "head-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(file_content.to_vec())
-                .file_name("file.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "head-test").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("file.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -457,7 +480,7 @@ fn test_head_request() {
 
     // HEAD request
     let resp = client
-        .head(&server.url("/head-test/file.txt"))
+        .head(server.url("/head-test/file.txt"))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -475,17 +498,15 @@ fn test_conditional_request_etag() {
     let file_content = b"etag test content";
 
     // Upload
-    let form = multipart::Form::new()
-        .text("path", "etag-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(file_content.to_vec())
-                .file_name("file.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "etag-test").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("file.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -494,20 +515,28 @@ fn test_conditional_request_etag() {
 
     // First GET to obtain ETag
     let resp = client
-        .get(&server.url("/etag-test/file.txt"))
+        .get(server.url("/etag-test/file.txt"))
         .send()
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let etag = resp.headers().get("etag").map(|v| v.to_str().unwrap().to_string());
+    let etag = resp
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_string());
 
     if let Some(etag) = etag {
         // Conditional GET with If-None-Match
         let resp = client
-            .get(&server.url("/etag-test/file.txt"))
+            .get(server.url("/etag-test/file.txt"))
             .header("If-None-Match", &etag)
             .send()
             .unwrap();
-        assert_eq!(resp.status(), 304, "Expected 304 Not Modified, got {}", resp.status());
+        assert_eq!(
+            resp.status(),
+            304,
+            "Expected 304 Not Modified, got {}",
+            resp.status()
+        );
     }
 }
 
@@ -517,18 +546,16 @@ fn test_path_traversal_rejected() {
     let token = generate_token(TEST_EMAIL);
     let client = server.client();
 
-    let form = multipart::Form::new()
-        .text("path", "../etc")
-        .part(
-            "file0",
-            multipart::Part::bytes(b"evil".to_vec())
-                .file_name("passwd")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "../etc").part(
+        "file0",
+        multipart::Part::bytes(b"evil".to_vec())
+            .file_name("passwd")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
 
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -543,17 +570,15 @@ fn test_upload_overwrite() {
     let client = server.client();
 
     // First upload
-    let form = multipart::Form::new()
-        .text("path", "dup-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(b"first upload".to_vec())
-                .file_name("same.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "dup-test").part(
+        "file0",
+        multipart::Part::bytes(b"first upload".to_vec())
+            .file_name("same.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -561,17 +586,15 @@ fn test_upload_overwrite() {
     assert_eq!(resp.status(), 200);
 
     // Second upload to same path - overwrites the file
-    let form = multipart::Form::new()
-        .text("path", "dup-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(b"second upload".to_vec())
-                .file_name("same.txt")
-                .mime_str("text/plain")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "dup-test").part(
+        "file0",
+        multipart::Part::bytes(b"second upload".to_vec())
+            .file_name("same.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -579,7 +602,7 @@ fn test_upload_overwrite() {
     assert_eq!(resp.status(), 200, "Re-upload should succeed (overwrite)");
 
     // Verify the new content
-    let resp = client.get(&server.url("/dup-test/same.txt")).send().unwrap();
+    let resp = client.get(server.url("/dup-test/same.txt")).send().unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().unwrap().as_ref(), b"second upload");
 }
@@ -587,11 +610,13 @@ fn test_upload_overwrite() {
 #[test]
 fn test_metrics_endpoint() {
     let server = TestServer::start();
-    let resp = server.client().get(&server.url("/metrics")).send().unwrap();
+    let resp = server.client().get(server.url("/metrics")).send().unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.text().unwrap();
-    assert!(body.contains("storage_free_space") || body.contains("storage_total_space"),
-        "Metrics should contain disk space info");
+    assert!(
+        body.contains("storage_free_space") || body.contains("storage_total_space"),
+        "Metrics should contain disk space info"
+    );
 }
 
 #[test]
@@ -601,17 +626,15 @@ fn test_content_type_preserved() {
     let client = server.client();
 
     // Upload a .json file
-    let form = multipart::Form::new()
-        .text("path", "ctype-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(b"{\"key\": \"value\"}".to_vec())
-                .file_name("data.json")
-                .mime_str("application/json")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "ctype-test").part(
+        "file0",
+        multipart::Part::bytes(b"{\"key\": \"value\"}".to_vec())
+            .file_name("data.json")
+            .mime_str("application/json")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -619,7 +642,10 @@ fn test_content_type_preserved() {
     assert_eq!(resp.status(), 200);
 
     // Download and check content-type
-    let resp = client.get(&server.url("/ctype-test/data.json")).send().unwrap();
+    let resp = client
+        .get(server.url("/ctype-test/data.json"))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let content_type = resp
         .headers()
@@ -644,17 +670,15 @@ fn test_large_file_upload() {
     let file_content: Vec<u8> = (0..1024 * 1024).map(|i| (i % 256) as u8).collect();
     let expected_len = file_content.len();
 
-    let form = multipart::Form::new()
-        .text("path", "large-test")
-        .part(
-            "file0",
-            multipart::Part::bytes(file_content)
-                .file_name("large.bin")
-                .mime_str("application/octet-stream")
-                .unwrap(),
-        );
+    let form = multipart::Form::new().text("path", "large-test").part(
+        "file0",
+        multipart::Part::bytes(file_content)
+            .file_name("large.bin")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
     let resp = client
-        .post(&server.url("/v1/file"))
+        .post(server.url("/v1/file"))
         .header("Authorization", format!("Bearer {}", token))
         .multipart(form)
         .send()
@@ -662,7 +686,10 @@ fn test_large_file_upload() {
     assert_eq!(resp.status(), 200);
 
     // Download and verify size
-    let resp = client.get(&server.url("/large-test/large.bin")).send().unwrap();
+    let resp = client
+        .get(server.url("/large-test/large.bin"))
+        .send()
+        .unwrap();
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().unwrap();
     assert_eq!(body.len(), expected_len, "Downloaded file size mismatch");
