@@ -339,6 +339,17 @@ async fn initial_setup() -> Option<RustlsConfig> {
         std::fs::create_dir(cache_dir).unwrap();
     }
 
+    // Migrate any legacy flat cache layout into the sharded layout before the
+    // maintenance tasks and request handlers start touching the cache.
+    {
+        let cache_dir = cache_dir.to_string();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || storcaching::migrate_cache_layout(&cache_dir)).await
+        {
+            eprintln!("Cache migration task failed: {}", e);
+        }
+    }
+
     let _validation = tokio::spawn(storcaching::validate_cache(cache_dir.to_string()));
     let _handle = tokio::spawn(storcaching::cache_loop(cache_dir));
 

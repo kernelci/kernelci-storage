@@ -3,6 +3,7 @@ use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
 use toml::Table;
@@ -12,6 +13,133 @@ const DEFAULT_CLEANUP_CHUNK: usize = 100_000;
 const DISK_SPACE_LOW_PERCENT: u64 = 12;
 const DISK_SPACE_RECOVER_PERCENT: u64 = 13;
 const HOUSEKEEPING_INTERVAL_SECS: u64 = 300;
+
+/// Length of the hex prefix used as the shard subdirectory name. One level of
+/// 256 buckets keeps each shard small even at the MAX_CACHE_FILES cap
+/// (~3.9k object pairs per shard), which is plenty for fast directory scans.
+const SHARD_PREFIX_LEN: usize = 2;
+
+/// Shard subdirectory name for a cache key (a lowercase hex digest).
+fn shard_name(hex: &str) -> &str {
+    let len = SHARD_PREFIX_LEN.min(hex.len());
+    &hex[..len]
+}
+
+/// Build the (content, headers) paths for a cache key under the sharded layout.
+pub fn cache_file_paths(cache_dir: &str, hex: &str) -> (PathBuf, PathBuf) {
+    let dir = Path::new(cache_dir).join(shard_name(hex));
+    (
+        dir.join(format!("{}.content", hex)),
+        dir.join(format!("{}.headers", hex)),
+    )
+}
+
+/// Ensure the shard subdirectory for a cache key exists before writing into it.
+pub fn ensure_shard_dir(cache_dir: &str, hex: &str) -> std::io::Result<()> {
+    fs::create_dir_all(Path::new(cache_dir).join(shard_name(hex)))
+}
+
+/// Collect every file path in the cache: shard subdirectories (one level deep)
+/// plus any legacy files still sitting directly in the cache root. This keeps
+/// the maintenance tasks working during and after migration.
+fn collect_cache_files(cache_dir: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Error reading cache directory ({}): {}", cache_dir, e);
+            return files;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            // Descend one level into shard subdirectories.
+            if let Ok(sub_entries) = fs::read_dir(entry.path()) {
+                for sub_entry in sub_entries.flatten() {
+                    files.push(sub_entry.path());
+                }
+            }
+        } else {
+            files.push(entry.path());
+        }
+    }
+
+    files
+}
+
+/// Migrate a legacy flat cache layout (`cache/<hash>.content`) into the
+/// one-level sharded layout (`cache/<ab>/<hash>.content`). Idempotent: files
+/// already inside shard subdirectories are skipped, so it is cheap to run on
+/// every startup once migration has completed.
+pub fn migrate_cache_layout(cache_dir: &str) {
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Cache migration: cannot read {}: {}", cache_dir, e);
+            return;
+        }
+    };
+
+    let mut moved: u64 = 0;
+    let mut failed: u64 = 0;
+
+    for entry in entries.flatten() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            continue; // already a shard directory
+        }
+
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if !(name.ends_with(".content") || name.ends_with(".headers")) {
+            continue;
+        }
+
+        // The filename starts with the hex digest; its first bytes form the shard.
+        if name.len() < SHARD_PREFIX_LEN
+            || !name.as_bytes()[..SHARD_PREFIX_LEN]
+                .iter()
+                .all(u8::is_ascii_hexdigit)
+        {
+            continue;
+        }
+
+        let shard_dir = Path::new(cache_dir).join(&name[..SHARD_PREFIX_LEN]);
+        if let Err(e) = fs::create_dir_all(&shard_dir) {
+            debug_log!("Cache migration: cannot create {:?}: {}", shard_dir, e);
+            failed += 1;
+            continue;
+        }
+
+        let target = shard_dir.join(&name);
+        match fs::rename(&path, &target) {
+            Ok(_) => moved += 1,
+            Err(e) => {
+                debug_log!("Cache migration: failed to move {:?}: {}", path, e);
+                failed += 1;
+            }
+        }
+    }
+
+    if moved > 0 || failed > 0 {
+        println!(
+            "[cache-migration] moved {} legacy cache files into sharded layout ({} failures).",
+            moved, failed
+        );
+    }
+}
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct CacheConfig {
@@ -83,13 +211,6 @@ struct CleanOutcome {
 
 fn scan_cache_directory(cache_dir: &str, chunk_size: usize) -> CacheScanResult {
     let mut result = CacheScanResult::default();
-    let entries = match fs::read_dir(cache_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("Error reading cache directory files ({}): {}", cache_dir, e);
-            return result;
-        }
-    };
 
     let mut heap = if chunk_size > 0 {
         Some(BinaryHeap::with_capacity(chunk_size.saturating_add(1)))
@@ -97,8 +218,7 @@ fn scan_cache_directory(cache_dir: &str, chunk_size: usize) -> CacheScanResult {
         None
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in collect_cache_files(cache_dir) {
         let file = match path.to_str() {
             Some(path_str) => path_str.to_string(),
             None => continue,
@@ -111,7 +231,7 @@ fn scan_cache_directory(cache_dir: &str, chunk_size: usize) -> CacheScanResult {
         result.total_files += 1;
 
         if let Some(heap) = heap.as_mut() {
-            let metadata = match entry.metadata() {
+            let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
                 Err(_) => continue,
             };
@@ -371,17 +491,9 @@ pub async fn cache_loop(cache_dir: &str) {
 
 fn remove_zero_sized_files(cache_dir: &str) -> u64 {
     let mut removed = 0;
-    let entries = match fs::read_dir(cache_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("Error reading cache directory during zero-sized cleanup: {}", e);
-            return 0;
-        }
-    };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let metadata = match entry.metadata() {
+    for path in collect_cache_files(cache_dir) {
+        let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
@@ -401,19 +513,11 @@ fn remove_zero_sized_files(cache_dir: &str) -> u64 {
 }
 
 fn remove_orphan_files(cache_dir: &str) -> u64 {
-    let entries = match fs::read_dir(cache_dir) {
-        Ok(entries) => entries,
-        Err(e) => {
-            eprintln!("Error reading cache directory during orphan cleanup: {}", e);
-            return 0;
-        }
-    };
-
     let mut contents = HashSet::new();
     let mut headers = HashSet::new();
 
-    for entry in entries.flatten() {
-        let path = match entry.path().to_str() {
+    for path in collect_cache_files(cache_dir) {
+        let path = match path.to_str() {
             Some(path) => path.to_string(),
             None => continue,
         };
