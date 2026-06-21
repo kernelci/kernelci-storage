@@ -111,6 +111,20 @@ fn calculate_checksum(filename: &str, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
+/// Build metadata sidecar content for a new upload: content-type, owner tag
+/// (when known) and the optional configured retention tag, so a future
+/// retention cleaner can identify expirable files.
+fn build_metadata_content(cont_type: &str, owner_email: Option<String>) -> String {
+    let mut metadata_content = format!("content-type:{}\n", cont_type);
+    if let Some(email) = owner_email {
+        metadata_content.push_str(&format!("tag-owner:{}\n", email));
+    }
+    if let Some((key, value)) = crate::get_retention_tag() {
+        metadata_content.push_str(&format!("tag-{}:{}\n", key, value));
+    }
+    metadata_content
+}
+
 /// Write file to local storage using streaming (new version)
 async fn write_file_to_local_streaming(
     filename: String,
@@ -147,13 +161,10 @@ async fn write_file_to_local_streaming(
         }
     }
 
-    // Create and write metadata (headers and owner tag)
+    // Create and write metadata (headers, owner and retention tags)
     let metadata_path = get_metadata_file_path(&filename);
     if let Ok(mut metadata_file) = File::create(&metadata_path) {
-        let mut metadata_content = format!("content-type:{}\n", cont_type);
-        if let Some(email) = owner_email {
-            metadata_content.push_str(&format!("tag-owner:{}\n", email));
-        }
+        let metadata_content = build_metadata_content(&cont_type, owner_email);
         let _ = metadata_file.write_all(metadata_content.as_bytes());
     }
 
@@ -189,13 +200,10 @@ fn write_file_to_local(
         }
     }
 
-    // Create and write metadata (headers and owner tag)
+    // Create and write metadata (headers, owner and retention tags)
     let metadata_path = get_metadata_file_path(&filename);
     if let Ok(mut metadata_file) = File::create(&metadata_path) {
-        let mut metadata_content = format!("content-type:{}\n", cont_type);
-        if let Some(email) = owner_email {
-            metadata_content.push_str(&format!("tag-owner:{}\n", email));
-        }
+        let metadata_content = build_metadata_content(&cont_type, owner_email);
         let _ = metadata_file.write_all(metadata_content.as_bytes());
     }
 

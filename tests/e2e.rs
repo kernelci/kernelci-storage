@@ -73,6 +73,9 @@ prefixes = ["restricted-area"]
 
 [cache]
 cleanup_chunk_size=100000
+
+[retention]
+tag_value = "6m"
 "#,
             storage_path.display()
         );
@@ -658,6 +661,49 @@ fn test_content_type_preserved() {
         "Unexpected content-type: {}",
         content_type
     );
+}
+
+#[test]
+fn test_retention_and_owner_tags_in_metadata() {
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let client = server.client();
+
+    let form = multipart::Form::new().text("path", "retention-test").part(
+        "file0",
+        multipart::Part::bytes(b"retention tag test".to_vec())
+            .file_name("tagged.txt")
+            .mime_str("text/plain")
+            .unwrap(),
+    );
+    let resp = client
+        .post(server.url("/v1/file"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // The metadata sidecar must carry the configured retention tag alongside
+    // the owner tag (sidecar filenames are path hashes, so scan the dir)
+    let metadata_dir = server
+        .work_dir
+        .path()
+        .join("storage")
+        .join(".metadata");
+    let mut found = false;
+    for entry in std::fs::read_dir(&metadata_dir).unwrap().flatten() {
+        let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        if content.contains("tag-retention:6m") {
+            assert!(
+                content.contains(&format!("tag-owner:{}", TEST_EMAIL)),
+                "Owner tag missing from metadata: {}",
+                content
+            );
+            found = true;
+        }
+    }
+    assert!(found, "No metadata file with retention tag found");
 }
 
 #[test]

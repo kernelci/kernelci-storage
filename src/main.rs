@@ -248,6 +248,30 @@ fn get_driver_type() -> String {
         .to_string()
 }
 
+/*
+Example config.toml section:
+
+[retention]
+tag_key = "retention"  # optional, defaults to "retention"
+tag_value = "6m"
+*/
+
+/// Optional retention tag applied to all new uploads.
+/// Backend lifecycle rules (e.g. Azure lifecycle management filtering on
+/// blob index tags) can match on it to expire objects. Returns None when
+/// the [retention] section or its tag_value is absent, disabling tagging.
+pub fn get_retention_tag() -> Option<(String, String)> {
+    let cfg_content = get_config_content();
+    let cfg: Table = toml::from_str(&cfg_content).ok()?;
+    let retention = cfg.get("retention")?;
+    let value = retention.get("tag_value").and_then(|v| v.as_str())?;
+    let key = retention
+        .get("tag_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("retention");
+    Some((key.to_string(), value.to_string()))
+}
+
 fn client_ip_from_headers(headers: &HeaderMap, fallback: SocketAddr) -> String {
     if let Some(forwarded_for) = headers
         .get("X-Forwarded-For")
@@ -313,6 +337,17 @@ async fn initial_setup() -> Option<RustlsConfig> {
 
     if !std::path::Path::new(cache_dir).exists() {
         std::fs::create_dir(cache_dir).unwrap();
+    }
+
+    // Migrate any legacy flat cache layout into the sharded layout before the
+    // maintenance tasks and request handlers start touching the cache.
+    {
+        let cache_dir = cache_dir.to_string();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || storcaching::migrate_cache_layout(&cache_dir)).await
+        {
+            eprintln!("Cache migration task failed: {}", e);
+        }
     }
 
     let _validation = tokio::spawn(storcaching::validate_cache(cache_dir.to_string()));

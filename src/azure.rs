@@ -90,6 +90,51 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
+/// Build blob index tags for a new upload: owner (when known) plus the
+/// optional configured retention tag. An Azure lifecycle management rule
+/// matching the retention tag (blobIndexMatch) can then expire the blob.
+/// Returns None when there is nothing to tag.
+fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    if let Some(email) = owner_email {
+        let sanitized = sanitize_tag_component(&email);
+        if sanitized != email {
+            debug_log!(
+                "Sanitized owner tag value from '{}' to '{}'",
+                email,
+                sanitized
+            );
+        }
+        // Ensure non-empty value
+        let final_value = if sanitized.is_empty() {
+            "_".to_string()
+        } else {
+            sanitized
+        };
+        pairs.push(("owner".to_string(), final_value));
+    }
+
+    if let Some((key, value)) = crate::get_retention_tag() {
+        let key = sanitize_tag_component(&key);
+        let value = sanitize_tag_component(&value);
+        if !key.is_empty() && !value.is_empty() {
+            pairs.push((key, value));
+        } else {
+            debug_log!("Retention tag is empty after sanitization, skipping");
+        }
+    }
+
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut tags = Tags::new();
+    for (key, value) in pairs {
+        tags.insert(key, value);
+    }
+    Some(tags)
+}
+
 /// Write file to Azure blob storage using streaming (new version)
 async fn write_file_to_blob_streaming(
     filename: String,
@@ -158,30 +203,15 @@ async fn write_file_to_blob_streaming(
                 }
             }
 
-            // Set owner tag if email is provided
-            if let Some(email) = owner_email {
-                let mut tags = Tags::new();
-                let sanitized = sanitize_tag_component(&email);
-                if sanitized != email {
-                    debug_log!(
-                        "Sanitized owner tag value from '{}' to '{}'",
-                        email,
-                        sanitized
-                    );
-                }
-                // Ensure non-empty value
-                let final_value = if sanitized.is_empty() {
-                    "_".to_string()
-                } else {
-                    sanitized
-                };
-                tags.insert("owner".to_string(), final_value);
+            // Set upload tags (owner + retention); set_tags replaces the
+            // whole tag set, so all tags must go in a single call
+            if let Some(tags) = upload_tags(owner_email) {
                 match blob_client.set_tags(tags).await {
                     Ok(_) => {
-                        debug_log!("Owner tag set successfully");
+                        debug_log!("Upload tags set successfully");
                     }
                     Err(e) => {
-                        eprintln!("Error setting owner tag: {:?}", e);
+                        eprintln!("Error setting upload tags: {:?}", e);
                     }
                 }
             }
@@ -276,30 +306,15 @@ async fn write_file_to_blob(
                 }
             }
 
-            // Set owner tag if email is provided
-            if let Some(email) = owner_email {
-                let mut tags = Tags::new();
-                let sanitized = sanitize_tag_component(&email);
-                if sanitized != email {
-                    debug_log!(
-                        "Sanitized owner tag value from '{}' to '{}'",
-                        email,
-                        sanitized
-                    );
-                }
-                // Ensure non-empty value
-                let final_value = if sanitized.is_empty() {
-                    "_".to_string()
-                } else {
-                    sanitized
-                };
-                tags.insert("owner".to_string(), final_value);
+            // Set upload tags (owner + retention); set_tags replaces the
+            // whole tag set, so all tags must go in a single call
+            if let Some(tags) = upload_tags(owner_email) {
                 match blob_client.set_tags(tags).await {
                     Ok(_) => {
-                        debug_log!("Owner tag set successfully");
+                        debug_log!("Upload tags set successfully");
                     }
                     Err(e) => {
-                        eprintln!("Error setting owner tag: {:?}", e);
+                        eprintln!("Error setting upload tags: {:?}", e);
                     }
                 }
             }
@@ -374,11 +389,14 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     };
     // append SAS token to blob URL
     blob_url.push_str(storage_sastoken);
-    // we generate a hash of the filename to use as cache filename
+    // we generate a hash of the filename to use as cache filename, sharded by
+    // the first hex byte of the digest so no single directory grows unbounded
     let hash = sha2_512::default().update(filename.as_bytes()).finalize();
     let digest = hash.digest();
-    let cache_filename = format!("cache/{}.content", digest.to_hex_lowercase());
-    let cache_filename_headers = format!("cache/{}.headers", digest.to_hex_lowercase());
+    let cache_hex = digest.to_hex_lowercase().to_string();
+    let (content_path, headers_path) = crate::storcaching::cache_file_paths("cache", &cache_hex);
+    let cache_filename = content_path.to_string_lossy().into_owned();
+    let cache_filename_headers = headers_path.to_string_lossy().into_owned();
     // check if cache file exists
     if std::path::Path::new(&cache_filename).exists() {
         // check if headers file exists, and if not wait up to 300 seconds
@@ -485,6 +503,11 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             received_file.headers = response.headers().clone();
             let resp_headers = response.headers().clone();
             let body = response.bytes().await.unwrap();
+            // ensure the shard subdirectory exists before writing into it
+            if let Err(e) = crate::storcaching::ensure_shard_dir("cache", &cache_hex) {
+                eprintln!("Error creating cache shard directory: {:?}", e);
+                return received_file;
+            }
             // just write all to cache file
             let mut f = File::create(&cache_filename).unwrap();
             f.write_all(&body).unwrap();

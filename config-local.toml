@@ -6,3 +6,8 @@ storage_path="./test-storage"
 
 [cache]
 cleanup_chunk_size=100000
+
+# Optional: tag all new uploads so backend lifecycle rules can expire them
+#[retention]
+#tag_key = "retention"  # optional, defaults to "retention"
+#tag_value = "6m"
