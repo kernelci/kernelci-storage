@@ -90,6 +90,51 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
+/// Build blob index tags for a new upload: owner (when known) plus the
+/// optional configured retention tag. An Azure lifecycle management rule
+/// matching the retention tag (blobIndexMatch) can then expire the blob.
+/// Returns None when there is nothing to tag.
+fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    if let Some(email) = owner_email {
+        let sanitized = sanitize_tag_component(&email);
+        if sanitized != email {
+            debug_log!(
+                "Sanitized owner tag value from '{}' to '{}'",
+                email,
+                sanitized
+            );
+        }
+        // Ensure non-empty value
+        let final_value = if sanitized.is_empty() {
+            "_".to_string()
+        } else {
+            sanitized
+        };
+        pairs.push(("owner".to_string(), final_value));
+    }
+
+    if let Some((key, value)) = crate::get_retention_tag() {
+        let key = sanitize_tag_component(&key);
+        let value = sanitize_tag_component(&value);
+        if !key.is_empty() && !value.is_empty() {
+            pairs.push((key, value));
+        } else {
+            debug_log!("Retention tag is empty after sanitization, skipping");
+        }
+    }
+
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut tags = Tags::new();
+    for (key, value) in pairs {
+        tags.insert(key, value);
+    }
+    Some(tags)
+}
+
 /// Write file to Azure blob storage using streaming (new version)
 async fn write_file_to_blob_streaming(
     filename: String,
@@ -158,30 +203,15 @@ async fn write_file_to_blob_streaming(
                 }
             }
 
-            // Set owner tag if email is provided
-            if let Some(email) = owner_email {
-                let mut tags = Tags::new();
-                let sanitized = sanitize_tag_component(&email);
-                if sanitized != email {
-                    debug_log!(
-                        "Sanitized owner tag value from '{}' to '{}'",
-                        email,
-                        sanitized
-                    );
-                }
-                // Ensure non-empty value
-                let final_value = if sanitized.is_empty() {
-                    "_".to_string()
-                } else {
-                    sanitized
-                };
-                tags.insert("owner".to_string(), final_value);
+            // Set upload tags (owner + retention); set_tags replaces the
+            // whole tag set, so all tags must go in a single call
+            if let Some(tags) = upload_tags(owner_email) {
                 match blob_client.set_tags(tags).await {
                     Ok(_) => {
-                        debug_log!("Owner tag set successfully");
+                        debug_log!("Upload tags set successfully");
                     }
                     Err(e) => {
-                        eprintln!("Error setting owner tag: {:?}", e);
+                        eprintln!("Error setting upload tags: {:?}", e);
                     }
                 }
             }
@@ -276,30 +306,15 @@ async fn write_file_to_blob(
                 }
             }
 
-            // Set owner tag if email is provided
-            if let Some(email) = owner_email {
-                let mut tags = Tags::new();
-                let sanitized = sanitize_tag_component(&email);
-                if sanitized != email {
-                    debug_log!(
-                        "Sanitized owner tag value from '{}' to '{}'",
-                        email,
-                        sanitized
-                    );
-                }
-                // Ensure non-empty value
-                let final_value = if sanitized.is_empty() {
-                    "_".to_string()
-                } else {
-                    sanitized
-                };
-                tags.insert("owner".to_string(), final_value);
+            // Set upload tags (owner + retention); set_tags replaces the
+            // whole tag set, so all tags must go in a single call
+            if let Some(tags) = upload_tags(owner_email) {
                 match blob_client.set_tags(tags).await {
                     Ok(_) => {
-                        debug_log!("Owner tag set successfully");
+                        debug_log!("Upload tags set successfully");
                     }
                     Err(e) => {
-                        eprintln!("Error setting owner tag: {:?}", e);
+                        eprintln!("Error setting upload tags: {:?}", e);
                     }
                 }
             }

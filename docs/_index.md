@@ -168,6 +168,45 @@ cleanup_chunk_size = 100000
 
 Raising the value makes each cleanup iteration more aggressive; lowering it favors smaller, more frequent deletions.
 
+### Upload Retention Tagging
+
+The server can tag every new upload with a retention marker so the storage backend can expire old files. The feature is disabled unless the `[retention]` section is present:
+
+```toml
+[retention]
+tag_key = "retention"  # optional, defaults to "retention"
+tag_value = "6m"
+```
+
+With the Azure backend, each upload gets a blob index tag (e.g. `retention=6m`) next to the existing `owner` tag. Deletion itself is performed by an Azure lifecycle management policy on the storage account that matches the tag — only tagged (i.e. new) blobs are affected:
+
+```json
+{
+  "rules": [
+    {
+      "enabled": true,
+      "name": "expire-tagged-uploads",
+      "type": "Lifecycle",
+      "definition": {
+        "actions": {
+          "baseBlob": {
+            "delete": { "daysAfterModificationGreaterThan": 180 }
+          }
+        },
+        "filters": {
+          "blobTypes": ["blockBlob"],
+          "blobIndexMatch": [
+            { "name": "retention", "op": "==", "value": "6m" }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+With the local backend, the tag is recorded as a `tag-retention:6m` line in the file's metadata sidecar, so a retention cleaner can identify expirable files.
+
 ## Environment Variables
 
 - `STORAGE_DEBUG`: Enable debug logging
