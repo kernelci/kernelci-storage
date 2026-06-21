@@ -1,4 +1,4 @@
-FROM rust:1.93@sha256:ecbe59a8408895edd02d9ef422504b8501dd9fa1526de27a45b73406d734d659 AS builder
+FROM rust:1.96@sha256:c6811167278337db5f3b0234964ced5f538f154a2a20f09ec03721d7411c933d AS builder
 WORKDIR /usr/src/app
 COPY . .
 RUN cargo build --release --locked
