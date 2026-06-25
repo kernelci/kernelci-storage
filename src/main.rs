@@ -38,6 +38,7 @@ use std::path::{self, Component};
 use std::sync::OnceLock;
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
 use futures::Future;
@@ -703,11 +704,18 @@ fn archive_reader(
             .map_err(|e| format!("Failed to initialize zstd decoder: {}", e));
     }
 
+    if lower_name.ends_with(".tar.xz") || lower_name.ends_with(".txz") {
+        return Ok(Box::new(XzDecoder::new(file)));
+    }
+
     if lower_name.ends_with(".tar") {
         return Ok(Box::new(file));
     }
 
-    Err("Unsupported archive type; expected .tar, .tar.gz, .tgz, .tar.zst, or .tzst".to_string())
+    Err(
+        "Unsupported archive type; expected .tar, .tar.gz, .tgz, .tar.zst, .tzst, .tar.xz, or .txz"
+            .to_string(),
+    )
 }
 
 fn unpack_archive_to_tempdir(
