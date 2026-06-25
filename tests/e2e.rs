@@ -7,6 +7,7 @@
 use jsonwebtoken::{encode, EncodingKey, Header};
 use reqwest::blocking::multipart;
 use serde::Serialize;
+use serde_json::Value;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -34,6 +35,54 @@ fn generate_token(email: &str) -> String {
         email: email.to_string(),
     };
     encode(&Header::default(), &claims, &key).unwrap()
+}
+
+fn build_tar_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut archive = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut archive);
+        for (path, content) in entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_path(path).unwrap();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append(&header, *content).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    archive
+}
+
+fn build_raw_tar_archive(path: &str, content: &[u8]) -> Vec<u8> {
+    fn write_octal_field(field: &mut [u8], value: u64) {
+        let encoded = format!("{:0width$o}\0", value, width = field.len() - 1);
+        field.copy_from_slice(encoded.as_bytes());
+    }
+
+    let mut header = [0u8; 512];
+    header[..path.len()].copy_from_slice(path.as_bytes());
+    write_octal_field(&mut header[100..108], 0o644);
+    write_octal_field(&mut header[108..116], 0);
+    write_octal_field(&mut header[116..124], 0);
+    write_octal_field(&mut header[124..136], content.len() as u64);
+    write_octal_field(&mut header[136..148], 0);
+    header[148..156].fill(b' ');
+    header[156] = b'0';
+    header[257..263].copy_from_slice(b"ustar\0");
+    header[263..265].copy_from_slice(b"00");
+
+    let checksum: u32 = header.iter().map(|byte| *byte as u32).sum();
+    let checksum_field = format!("{:06o}\0 ", checksum);
+    header[148..156].copy_from_slice(checksum_field.as_bytes());
+
+    let mut archive = Vec::new();
+    archive.extend_from_slice(&header);
+    archive.extend_from_slice(content);
+    let padding = (512 - (content.len() % 512)) % 512;
+    archive.extend(std::iter::repeat(0).take(padding));
+    archive.extend(std::iter::repeat(0).take(1024));
+    archive
 }
 
 /// Test server handle - kills the server process on drop
@@ -278,6 +327,94 @@ fn test_upload_via_legacy_endpoint() {
     let resp = client.get(server.url("/legacy/test.bin")).send().unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.bytes().unwrap().as_ref(), file_content);
+}
+
+#[test]
+fn test_archive_upload_unpacks_files() {
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let client = server.client();
+
+    let archive = build_tar_archive(&[
+        ("omap4-droid-bionic-xt875.dtb", b"omap4 dtb"),
+        ("nested/imx6ull-tarragon-micro.dtb", b"imx6 dtb"),
+        ("rv1108-evb.dtb", b"rv1108 dtb"),
+    ]);
+
+    let form = multipart::Form::new()
+        .text(
+            "path",
+            "kbuild-clang-21-arm-allmodconfig-6a3c1ef26de4dcc0f43c0656/dtbs",
+        )
+        .part(
+            "archive",
+            multipart::Part::bytes(archive)
+                .file_name("dtbs.tar")
+                .mime_str("application/x-tar")
+                .unwrap(),
+        );
+
+    let resp = client
+        .post(server.url("/v1/archive"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "Archive upload failed: {:?}",
+        resp.text()
+    );
+    let body: Value = serde_json::from_str(&resp.text().unwrap()).unwrap();
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["uploaded"], 3);
+    assert_eq!(body["failed"], 0);
+
+    let resp = client
+        .get(server.url(
+            "/kbuild-clang-21-arm-allmodconfig-6a3c1ef26de4dcc0f43c0656/dtbs/omap4-droid-bionic-xt875.dtb",
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().unwrap().as_ref(), b"omap4 dtb");
+
+    let resp = client
+        .get(server.url(
+            "/kbuild-clang-21-arm-allmodconfig-6a3c1ef26de4dcc0f43c0656/dtbs/nested/imx6ull-tarragon-micro.dtb",
+        ))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().unwrap().as_ref(), b"imx6 dtb");
+}
+
+#[test]
+fn test_archive_upload_rejects_path_traversal() {
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let client = server.client();
+
+    let archive = build_raw_tar_archive("../evil.dtb", b"evil");
+    let form = multipart::Form::new().text("path", "safe-prefix").part(
+        "archive",
+        multipart::Part::bytes(archive)
+            .file_name("evil.tar")
+            .mime_str("application/x-tar")
+            .unwrap(),
+    );
+
+    let resp = client
+        .post(server.url("/v1/archive"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let resp = client.get(server.url("/evil.dtb")).send().unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 #[test]

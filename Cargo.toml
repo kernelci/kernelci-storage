@@ -14,6 +14,7 @@ bytes = "1.11"
 chksum-hash-sha2-512 = "0.0.1"
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
+flate2 = "1.1.5"
 fs2 = "0.4.3"
 futures = "0.3.32"
 futures-util = "0.3.32"
@@ -25,7 +26,9 @@ rand = "0.10.1"
 reqwest = { version = "0.13.4", features = ["blocking"] }
 rustls = "0.23.40"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
 sysinfo = { version = "0.39.3", features = ["serde"] }
+tar = "0.4.44"
 tempfile = "3.27.0"
 tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "macros"] }
 tokio-util = "0.7.18"
@@ -34,6 +37,7 @@ tower = "0.5.3"
 tower-http = { version = "0.6.11", features = ["trace", "fs", "limit"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+zstd = "0.13.3"
 
 [dev-dependencies]
 reqwest = { version = "0.13.4", features = ["blocking", "multipart"] }

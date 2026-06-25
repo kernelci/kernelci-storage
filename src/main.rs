@@ -29,11 +29,16 @@ use axum::{
 use axum_server::tls_rustls::RustlsConfig;
 use bytes::Bytes;
 use clap::Parser;
+use flate2::read::GzDecoder;
+use futures::StreamExt;
 use headers::HeaderMap;
-use std::path;
+use serde::Serialize;
+use std::io::Read;
+use std::path::{self, Component};
 use std::sync::OnceLock;
 use std::{net::SocketAddr, path::PathBuf};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 use futures::Future;
 use std::pin::Pin;
@@ -93,6 +98,28 @@ type FileSemaphores = Arc<RwLock<HashMap<String, Arc<Semaphore>>>>;
 #[derive(Clone)]
 struct AppState {
     file_locks: FileSemaphores,
+}
+
+const ARCHIVE_MAX_FILES: usize = 10_000;
+const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const ARCHIVE_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+const ARCHIVE_DEFAULT_PARALLELISM: usize = 4;
+
+struct ExtractedArchiveEntry {
+    storage_path: String,
+    temp_path: PathBuf,
+    content_type: String,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct ArchiveResponse {
+    status: String,
+    uploaded: usize,
+    failed: usize,
+    bytes: u64,
+    prefix: String,
+    failures: Vec<String>,
 }
 
 async fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<Semaphore> {
@@ -452,6 +479,7 @@ async fn main() {
         .route("/favicon.ico", get(get_favicon))
         .route("/v1/checkauth", get(ax_check_auth))
         .route("/v1/file", post(ax_post_file))
+        .route("/v1/archive", post(ax_post_archive))
         .route("/upload", post(ax_post_file))
         .route("/{*filepath}", get(ax_get_file))
         .route("/v1/list", get(ax_list_files))
@@ -597,6 +625,482 @@ fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
         "User {} has no upload permissions for path {}",
         owner, path
     ))
+}
+
+fn archive_parallelism() -> usize {
+    std::env::var("KCI_STORAGE_ARCHIVE_PARALLELISM")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(ARCHIVE_DEFAULT_PARALLELISM)
+}
+
+fn archive_json_response(status: StatusCode, response: ArchiveResponse) -> impl IntoResponse {
+    let body = serde_json::to_string(&response).unwrap_or_else(|_| {
+        "{\"status\":\"error\",\"uploaded\":0,\"failed\":1,\"bytes\":0,\"prefix\":\"\",\"failures\":[\"failed to serialize response\"]}".to_string()
+    });
+    (status, [(header::CONTENT_TYPE, "application/json")], body)
+}
+
+fn archive_error_response(status: StatusCode, prefix: String, error: String) -> impl IntoResponse {
+    archive_json_response(
+        status,
+        ArchiveResponse {
+            status: "error".to_string(),
+            uploaded: 0,
+            failed: 1,
+            bytes: 0,
+            prefix,
+            failures: vec![error],
+        },
+    )
+}
+
+fn sanitize_archive_entry_path(entry_path: &path::Path) -> Result<String, String> {
+    let mut components = Vec::new();
+
+    for component in entry_path.components() {
+        match component {
+            Component::Normal(part) => {
+                let part = part
+                    .to_str()
+                    .ok_or_else(|| "Archive entry path is not valid UTF-8".to_string())?;
+                if part.is_empty() {
+                    return Err("Archive entry contains an empty path component".to_string());
+                }
+                components.push(part.to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "Archive entry path is not relative and safe: {}",
+                    entry_path.display()
+                ));
+            }
+        }
+    }
+
+    if components.is_empty() {
+        return Err("Archive entry path is empty".to_string());
+    }
+
+    Ok(components.join("/"))
+}
+
+fn archive_reader(
+    file: std::fs::File,
+    archive_filename: &str,
+) -> Result<Box<dyn Read + Send>, String> {
+    let lower_name = archive_filename.to_ascii_lowercase();
+
+    if lower_name.ends_with(".tar.gz") || lower_name.ends_with(".tgz") {
+        return Ok(Box::new(GzDecoder::new(file)));
+    }
+
+    if lower_name.ends_with(".tar.zst") || lower_name.ends_with(".tzst") {
+        return ZstdDecoder::new(file)
+            .map(|decoder| Box::new(decoder) as Box<dyn Read + Send>)
+            .map_err(|e| format!("Failed to initialize zstd decoder: {}", e));
+    }
+
+    if lower_name.ends_with(".tar") {
+        return Ok(Box::new(file));
+    }
+
+    Err("Unsupported archive type; expected .tar, .tar.gz, .tgz, .tar.zst, or .tzst".to_string())
+}
+
+fn unpack_archive_to_tempdir(
+    archive_path: PathBuf,
+    archive_filename: String,
+    prefix: String,
+) -> Result<(tempfile::TempDir, Vec<ExtractedArchiveEntry>), String> {
+    let archive_file = std::fs::File::open(&archive_path)
+        .map_err(|e| format!("Failed to open archived upload: {}", e))?;
+    let reader = archive_reader(archive_file, &archive_filename)?;
+    let mut archive = tar::Archive::new(reader);
+    let temp_dir = tempfile::tempdir()
+        .map_err(|e| format!("Failed to create archive extraction directory: {}", e))?;
+    let mut entries = Vec::new();
+    let mut unpacked_bytes = 0u64;
+
+    let archive_entries = archive
+        .entries()
+        .map_err(|e| format!("Failed to read tar entries: {}", e))?;
+
+    for entry_result in archive_entries {
+        let mut entry = entry_result.map_err(|e| format!("Failed to read tar entry: {}", e))?;
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            continue;
+        }
+        if !entry_type.is_file() {
+            let entry_path = entry
+                .path()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "<invalid path>".to_string());
+            return Err(format!(
+                "Unsupported archive entry type for {}; only regular files are accepted",
+                entry_path
+            ));
+        }
+
+        if entries.len() >= ARCHIVE_MAX_FILES {
+            return Err(format!(
+                "Archive contains more than {} regular files",
+                ARCHIVE_MAX_FILES
+            ));
+        }
+
+        let entry_path = entry
+            .path()
+            .map_err(|e| format!("Failed to read tar entry path: {}", e))?;
+        let relative_path = sanitize_archive_entry_path(entry_path.as_ref())?;
+        validate_path(&relative_path)?;
+
+        let entry_size = entry
+            .header()
+            .size()
+            .map_err(|e| format!("Failed to read tar entry size: {}", e))?;
+        if entry_size > ARCHIVE_MAX_FILE_BYTES {
+            return Err(format!(
+                "Archive entry {} is larger than {} bytes",
+                relative_path, ARCHIVE_MAX_FILE_BYTES
+            ));
+        }
+        unpacked_bytes = unpacked_bytes
+            .checked_add(entry_size)
+            .ok_or_else(|| "Archive unpacked size overflow".to_string())?;
+        if unpacked_bytes > ARCHIVE_MAX_UNPACKED_BYTES {
+            return Err(format!(
+                "Archive unpacks to more than {} bytes",
+                ARCHIVE_MAX_UNPACKED_BYTES
+            ));
+        }
+
+        let mut destination_prefix = prefix.clone();
+        let storage_path = build_storage_key(&mut destination_prefix, &relative_path)?;
+        let temp_path = temp_dir.path().join(format!("entry-{}", entries.len()));
+        let mut output = std::fs::File::create(&temp_path)
+            .map_err(|e| format!("Failed to create extracted file: {}", e))?;
+        let copied = std::io::copy(&mut entry, &mut output)
+            .map_err(|e| format!("Failed to unpack {}: {}", relative_path, e))?;
+        if copied != entry_size {
+            return Err(format!(
+                "Archive entry {} size mismatch: expected {}, unpacked {}",
+                relative_path, entry_size, copied
+            ));
+        }
+
+        entries.push(ExtractedArchiveEntry {
+            storage_path,
+            temp_path,
+            content_type: heuristic_filetype(relative_path),
+            size: entry_size,
+        });
+    }
+
+    if entries.is_empty() {
+        return Err("Archive did not contain any regular files".to_string());
+    }
+
+    Ok((temp_dir, entries))
+}
+
+async fn spool_archive_field(
+    field: axum::extract::multipart::Field<'_>,
+) -> Result<(tempfile::NamedTempFile, u64), String> {
+    use tokio::io::AsyncReadExt;
+
+    let tmp = tempfile::NamedTempFile::new()
+        .map_err(|e| format!("Failed to create archive temp file: {}", e))?;
+    let tmp_path = tmp.path().to_path_buf();
+    let mut output = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| format!("Failed to open archive temp file: {}", e))?;
+    let mut field_stream = FieldStream::new(field);
+    let mut total_size = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+
+    loop {
+        let bytes_read = field_stream
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("Failed to read archive upload: {}", e))?;
+        if bytes_read == 0 {
+            break;
+        }
+        total_size = total_size
+            .checked_add(bytes_read as u64)
+            .ok_or_else(|| "Archive upload size overflow".to_string())?;
+        output
+            .write_all(&buf[..bytes_read])
+            .await
+            .map_err(|e| format!("Failed to write archive temp file: {}", e))?;
+    }
+
+    output
+        .flush()
+        .await
+        .map_err(|e| format!("Failed to flush archive temp file: {}", e))?;
+    drop(output);
+
+    Ok((tmp, total_size))
+}
+
+async fn upload_extracted_archive_entry(
+    state: AppState,
+    owner: String,
+    entry: ExtractedArchiveEntry,
+) -> Result<u64, String> {
+    let semaphore = get_or_create_semaphore(&state.file_locks, &entry.storage_path).await;
+    let permit =
+        match tokio::time::timeout(tokio::time::Duration::from_secs(30), semaphore.acquire()).await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(format!("{}: upload semaphore closed", entry.storage_path)),
+            Err(_) => {
+                return Err(format!(
+                    "{}: timeout waiting for upload lock",
+                    entry.storage_path
+                ))
+            }
+        };
+
+    let upload_result = async {
+        let mut input = tokio::fs::File::open(&entry.temp_path).await.map_err(|e| {
+            format!(
+                "{}: failed to open extracted file: {}",
+                entry.storage_path, e
+            )
+        })?;
+        let driver_name = get_driver_type();
+        let driver = init_driver(&driver_name);
+        let (result, file_size) = driver
+            .write_file_streaming(
+                entry.storage_path.clone(),
+                &mut input,
+                entry.content_type.clone(),
+                Some(owner),
+            )
+            .await;
+
+        if result.is_empty() {
+            return Err(format!("{}: backend write failed", entry.storage_path));
+        }
+        if file_size as u64 != entry.size {
+            return Err(format!(
+                "{}: uploaded size mismatch: expected {}, uploaded {}",
+                entry.storage_path, entry.size, file_size
+            ));
+        }
+
+        Ok(file_size as u64)
+    }
+    .await;
+
+    drop(permit);
+    cleanup_semaphore(&state.file_locks, &entry.storage_path).await;
+    upload_result
+}
+
+async fn ax_post_archive(
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
+    OriginalUri(original_uri): OriginalUri,
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let client_info = client_info_str(&headers, remote_addr);
+    let owner = match verify_auth_hdr(&headers, &client_info) {
+        Ok(owner) => owner,
+        Err(_) => {
+            return archive_error_response(
+                StatusCode::UNAUTHORIZED,
+                String::new(),
+                "Unauthorized".to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    let mut path = String::new();
+    let mut archive_filename = String::new();
+    let mut archive_tmp: Option<tempfile::NamedTempFile> = None;
+    let mut archive_upload_bytes = 0u64;
+
+    while let Some(field) = match multipart.next_field().await {
+        Ok(field) => field,
+        Err(e) => {
+            return archive_error_response(
+                StatusCode::BAD_REQUEST,
+                path,
+                format!("Malformed multipart request: {}", e),
+            )
+            .into_response();
+        }
+    } {
+        let name = match field.name() {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        if name == "path" {
+            match field.bytes().await {
+                Ok(data) => {
+                    path = String::from_utf8(data.to_vec())
+                        .unwrap_or_else(|_| String::from_utf8_lossy(&data).to_string());
+                }
+                Err(e) => {
+                    return archive_error_response(
+                        StatusCode::BAD_REQUEST,
+                        path,
+                        format!("Error reading path field: {}", e),
+                    )
+                    .into_response();
+                }
+            }
+        } else if name == "archive" {
+            archive_filename = match field.file_name() {
+                Some(filename) => filename.to_string(),
+                None => {
+                    return archive_error_response(
+                        StatusCode::BAD_REQUEST,
+                        path,
+                        "No archive filename provided".to_string(),
+                    )
+                    .into_response();
+                }
+            };
+            match spool_archive_field(field).await {
+                Ok((tmp, size)) => {
+                    archive_tmp = Some(tmp);
+                    archive_upload_bytes = size;
+                }
+                Err(e) => {
+                    return archive_error_response(StatusCode::BAD_REQUEST, path, e)
+                        .into_response();
+                }
+            }
+        } else {
+            match field.bytes().await {
+                Ok(data) => debug_log!(
+                    "Unknown archive upload field {}: {} bytes",
+                    name,
+                    data.len()
+                ),
+                Err(e) => eprintln!("Error reading archive upload field {}: {:?}", name, e),
+            }
+        }
+    }
+
+    let archive_tmp = match archive_tmp {
+        Some(tmp) => tmp,
+        None => {
+            return archive_error_response(
+                StatusCode::BAD_REQUEST,
+                path,
+                "No archive field in upload".to_string(),
+            )
+            .into_response();
+        }
+    };
+
+    if let Err(e) = verify_upload_permissions(&owner, &path) {
+        return archive_error_response(StatusCode::FORBIDDEN, path, e).into_response();
+    }
+
+    let archive_path = archive_tmp.path().to_path_buf();
+    let unpack_prefix = path.clone();
+    let unpack_filename = archive_filename.clone();
+    let unpacked = match tokio::task::spawn_blocking(move || {
+        unpack_archive_to_tempdir(archive_path, unpack_filename, unpack_prefix)
+    })
+    .await
+    {
+        Ok(Ok(unpacked)) => unpacked,
+        Ok(Err(e)) => {
+            return archive_error_response(StatusCode::BAD_REQUEST, path, e).into_response();
+        }
+        Err(e) => {
+            return archive_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                path,
+                format!("Archive unpack task failed: {}", e),
+            )
+            .into_response();
+        }
+    };
+
+    let (_unpack_dir, entries) = unpacked;
+    let total_files = entries.len();
+    let parallelism = archive_parallelism();
+    let upload_results: Vec<Result<u64, String>> =
+        futures::stream::iter(entries.into_iter().map(|entry| {
+            let state = state.clone();
+            let owner = owner.clone();
+            async move { upload_extracted_archive_entry(state, owner, entry).await }
+        }))
+        .buffer_unordered(parallelism)
+        .collect()
+        .await;
+
+    let mut uploaded = 0usize;
+    let mut uploaded_bytes = 0u64;
+    let mut failures = Vec::new();
+    for result in upload_results {
+        match result {
+            Ok(bytes) => {
+                uploaded += 1;
+                uploaded_bytes += bytes;
+            }
+            Err(e) => failures.push(e),
+        }
+    }
+
+    let response_status = if failures.is_empty() {
+        StatusCode::OK
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    let status_text = if failures.is_empty() {
+        "ok"
+    } else {
+        "partial_failure"
+    };
+
+    let client_ip = client_ip_from_headers(&headers, remote_addr);
+    let timestamp = std::time::SystemTime::now();
+    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
+    let request_target = original_uri.to_string();
+    println!(
+        "{} {} {} {} {} {} {} {} archive files={} uploaded={} failed={} archive_bytes={}",
+        client_ip,
+        response_status.as_u16(),
+        uploaded_bytes,
+        human_time,
+        Method::POST,
+        request_target,
+        path,
+        owner,
+        total_files,
+        uploaded,
+        failures.len(),
+        archive_upload_bytes
+    );
+
+    archive_json_response(
+        response_status,
+        ArchiveResponse {
+            status: status_text.to_string(),
+            uploaded,
+            failed: failures.len(),
+            bytes: uploaded_bytes,
+            prefix: path,
+            failures,
+        },
+    )
+    .into_response()
 }
 
 /*

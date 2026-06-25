@@ -92,6 +92,7 @@ curl -X GET https://localhost:3000/v1/checkauth \
 
 - `GET /` - Server status
 - `POST /v1/file` or `POST /upload` - File upload (requires JWT)
+- `POST /v1/archive` - Tar archive upload with server-side extraction (requires JWT)
 - `GET /*filepath` - File download (public, supports range requests)
 - `GET /v1/checkauth` - Validate JWT token
 - `GET /v1/list` - List all files (public)
@@ -111,6 +112,21 @@ curl -X POST http://localhost:3000/v1/file \
 ```
 
 The resulting object is stored under `artifacts/build-123/<local filename>`. Swap in `/upload` if you prefer the shorter alias or use the public host name instead of `localhost` when interacting with a remote server.
+
+### Uploading Many Files as an Archive
+
+For large batches of small files, such as hundreds of DTBs, upload a tar archive to `/v1/archive`. The server extracts regular files from `.tar`, `.tar.gz`, `.tgz`, `.tar.zst`, or `.tzst` archives and writes each file as an individual object through the configured storage backend.
+
+```bash
+tar --zstd -cf dtbs.tar.zst -C /path/to/build/dtbs .
+
+curl -X POST http://localhost:3000/v1/archive \
+    -H "Authorization: Bearer <JWT_TOKEN>" \
+    -F "path=artifacts/build-123/dtbs" \
+    -F "archive=@dtbs.tar.zst"
+```
+
+Archive entries are stored under the requested prefix. The server rejects path traversal, absolute paths, links, devices, and other non-regular files. Upload concurrency defaults to 4 files and can be adjusted with `KCI_STORAGE_ARCHIVE_PARALLELISM`.
 
 ### Metrics
 
