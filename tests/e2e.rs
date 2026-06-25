@@ -8,6 +8,7 @@ use jsonwebtoken::{encode, EncodingKey, Header};
 use reqwest::blocking::multipart;
 use serde::Serialize;
 use serde_json::Value;
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command};
@@ -52,6 +53,12 @@ fn build_tar_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
         builder.finish().unwrap();
     }
     archive
+}
+
+fn xz_compress(data: &[u8]) -> Vec<u8> {
+    let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
 }
 
 fn build_raw_tar_archive(path: &str, content: &[u8]) -> Vec<u8> {
@@ -335,11 +342,11 @@ fn test_archive_upload_unpacks_files() {
     let token = generate_token(TEST_EMAIL);
     let client = server.client();
 
-    let archive = build_tar_archive(&[
+    let archive = xz_compress(&build_tar_archive(&[
         ("omap4-droid-bionic-xt875.dtb", b"omap4 dtb"),
         ("nested/imx6ull-tarragon-micro.dtb", b"imx6 dtb"),
         ("rv1108-evb.dtb", b"rv1108 dtb"),
-    ]);
+    ]));
 
     let form = multipart::Form::new()
         .text(
@@ -349,8 +356,8 @@ fn test_archive_upload_unpacks_files() {
         .part(
             "archive",
             multipart::Part::bytes(archive)
-                .file_name("dtbs.tar")
-                .mime_str("application/x-tar")
+                .file_name("dtbs.tar.xz")
+                .mime_str("application/x-xz")
                 .unwrap(),
         );
 
@@ -823,11 +830,7 @@ fn test_retention_and_owner_tags_in_metadata() {
 
     // The metadata sidecar must carry the configured retention tag alongside
     // the owner tag (sidecar filenames are path hashes, so scan the dir)
-    let metadata_dir = server
-        .work_dir
-        .path()
-        .join("storage")
-        .join(".metadata");
+    let metadata_dir = server.work_dir.path().join("storage").join(".metadata");
     let mut found = false;
     for entry in std::fs::read_dir(&metadata_dir).unwrap().flatten() {
         let content = std::fs::read_to_string(entry.path()).unwrap_or_default();

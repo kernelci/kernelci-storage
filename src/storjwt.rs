@@ -66,7 +66,10 @@ pub fn verify_jwt_token(
             }
         }
     } else {
-        eprintln!("{} No unified_secret configured {}", human_time, client_info);
+        eprintln!(
+            "{} No unified_secret configured {}",
+            human_time, client_info
+        );
     }
 
     eprintln!(

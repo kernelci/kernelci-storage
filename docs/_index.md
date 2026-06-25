@@ -26,7 +26,7 @@ Upload and unpack a tar archive. Requires JWT authentication.
 
 **Form fields:**
 - `path`: The destination prefix for extracted files
-- `archive`: The `.tar`, `.tar.gz`, `.tgz`, `.tar.zst`, or `.tzst` archive to upload
+- `archive`: The `.tar`, `.tar.gz`, `.tgz`, `.tar.zst`, `.tzst`, `.tar.xz`, or `.txz` archive to upload
 
 Only regular files are accepted from the archive. Absolute paths, parent-directory traversal, links, devices, and other special entries are rejected. Extracted files are uploaded as normal backend objects with the same owner and retention handling as single-file uploads. The server uploads extracted files with limited parallelism; set `KCI_STORAGE_ARCHIVE_PARALLELISM` to tune it.
 
@@ -82,11 +82,11 @@ curl -X POST https://files.kernelci.org/v1/file \
 # File will be uploaded as testfolder/local_folder/local_file
 
 # Bulk upload many files
-tar --zstd -cf dtbs.tar.zst -C local_folder/dtbs .
+tar -cJf dtbs.tar.xz -C local_folder/dtbs .
 curl -X POST https://files.kernelci.org/v1/archive \
     -H "Authorization: Bearer <JWT_TOKEN>" \
     -F "path=testfolder/dtbs" \
-    -F "archive=@dtbs.tar.zst"
+    -F "archive=@dtbs.tar.xz"
 
 # Download a file
 curl https://files.kernelci.org/testfolder/local_folder/local_file
