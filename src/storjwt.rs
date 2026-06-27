@@ -1,4 +1,7 @@
-use crate::get_config_content;
+use crate::{
+    get_config_content,
+    logging::{format_log_timestamp, logfmt_string},
+};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -24,13 +27,31 @@ fn verify_with_key_str(
     Ok(claims)
 }
 
+fn log_auth_warning(message: &str, error: Option<&jsonwebtoken::errors::Error>, client_info: &str) {
+    let timestamp = format_log_timestamp(std::time::SystemTime::now());
+    match error {
+        Some(error) => eprintln!(
+            "ts={} level=warn event=auth msg={} error={} {}",
+            timestamp,
+            logfmt_string(message),
+            logfmt_string(&format!("{:?}", error)),
+            client_info
+        ),
+        None => eprintln!(
+            "ts={} level=warn event=auth msg={} {}",
+            timestamp,
+            logfmt_string(message),
+            client_info
+        ),
+    }
+}
+
 pub fn verify_jwt_token(
     token_str: &str,
     client_info: &str,
 ) -> Result<BTreeMap<String, String>, jsonwebtoken::errors::Error> {
     let toml_cfg = get_config_content();
     let parsed_toml = toml_cfg.parse::<Table>().unwrap();
-    let human_time = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now());
 
     // If only unified_secret is configured, it serves as jwt_secret as well.
     // Try jwt_secret first, then fall through to unified_secret.
@@ -41,14 +62,15 @@ pub fn verify_jwt_token(
                 return Ok(claims);
             }
             Err(e) => {
-                eprintln!(
-                    "{} JWT verification with jwt_secret failed: {:?} {}",
-                    human_time, e, client_info
+                log_auth_warning(
+                    "JWT verification with jwt_secret failed",
+                    Some(&e),
+                    client_info,
                 );
             }
         }
     } else {
-        eprintln!("{} No jwt_secret configured {}", human_time, client_info);
+        log_auth_warning("No jwt_secret configured", None, client_info);
     }
 
     if let Some(unified) = parsed_toml.get("unified_secret").and_then(|v| v.as_str()) {
@@ -58,23 +80,22 @@ pub fn verify_jwt_token(
                 return Ok(claims);
             }
             Err(e) => {
-                eprintln!(
-                    "{} JWT verification with unified_secret also failed: {:?} {}",
-                    human_time, e, client_info
+                log_auth_warning(
+                    "JWT verification with unified_secret also failed",
+                    Some(&e),
+                    client_info,
                 );
                 return Err(e);
             }
         }
     } else {
-        eprintln!(
-            "{} No unified_secret configured {}",
-            human_time, client_info
-        );
+        log_auth_warning("No unified_secret configured", None, client_info);
     }
 
-    eprintln!(
-        "{} JWT verification error: no matching secret found {}",
-        human_time, client_info
+    log_auth_warning(
+        "JWT verification error: no matching secret found",
+        None,
+        client_info,
     );
     Err(jsonwebtoken::errors::ErrorKind::InvalidSignature.into())
 }
