@@ -90,11 +90,32 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
+/// Whether upload tagging is enabled. Disabled by default (tagging costs an
+/// extra set_tags round-trip per upload and nothing here reads the tags back);
+/// enable via KCI_STORAGE_ENABLE_UPLOAD_TAGS=1/true/yes when a backend
+/// lifecycle rule needs the owner/retention index tags.
+fn upload_tags_enabled() -> bool {
+    std::env::var("KCI_STORAGE_ENABLE_UPLOAD_TAGS")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes"
+        })
+        .unwrap_or(false)
+}
+
 /// Build blob index tags for a new upload: owner (when known) plus the
 /// optional configured retention tag. An Azure lifecycle management rule
 /// matching the retention tag (blobIndexMatch) can then expire the blob.
 /// Returns None when there is nothing to tag.
 fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
+    // Tagging costs an extra set_tags round-trip per upload and is off by
+    // default; enable via KCI_STORAGE_ENABLE_UPLOAD_TAGS when a backend
+    // lifecycle rule consumes the owner/retention index tags.
+    if !upload_tags_enabled() {
+        return None;
+    }
+
     let mut pairs: Vec<(String, String)> = Vec::new();
 
     if let Some(email) = owner_email {

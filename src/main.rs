@@ -36,7 +36,7 @@ use serde::Serialize;
 use std::io::Read;
 use std::path::{self, Component};
 use std::sync::OnceLock;
-use std::{net::SocketAddr, path::PathBuf};
+use std::{net::SocketAddr, path::PathBuf, time::SystemTime};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -104,7 +104,13 @@ struct AppState {
 const ARCHIVE_MAX_FILES: usize = 10_000;
 const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ARCHIVE_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
-const ARCHIVE_DEFAULT_PARALLELISM: usize = 4;
+// Each archive entry costs ~3 Azure round-trips (put_block, put_block_list,
+// set_tags), so uploads are latency-bound; a small default serializes large
+// batches (e.g. 1k files) past the reverse-proxy header timeout. Raised to 16
+// to keep big batches under typical proxy limits. Note each concurrent upload
+// allocates a 10MB chunk buffer, so this trades ~160MB peak memory for speed;
+// tune via KCI_STORAGE_ARCHIVE_PARALLELISM.
+const ARCHIVE_DEFAULT_PARALLELISM: usize = 16;
 
 struct ExtractedArchiveEntry {
     storage_path: String,
@@ -253,6 +259,69 @@ fn init_driver(driver_type: &str) -> Box<dyn Driver> {
         }
     };
     driver
+}
+
+fn log_access(
+    timestamp: SystemTime,
+    client_ip: &str,
+    status: StatusCode,
+    bytes: u64,
+    method: &str,
+    target: &str,
+    path: &str,
+    subject_key: &str,
+    subject_value: &str,
+) {
+    println!(
+        "ts={} event=access ip={} status={} bytes={} method={} target={} path={} {}={}",
+        logging::format_log_timestamp(timestamp),
+        logging::logfmt_string(client_ip),
+        status.as_u16(),
+        bytes,
+        method,
+        logging::logfmt_string(target),
+        logging::logfmt_string(path),
+        subject_key,
+        logging::logfmt_string(subject_value)
+    );
+}
+
+fn log_archive_access(
+    timestamp: SystemTime,
+    client_ip: &str,
+    status: StatusCode,
+    uploaded_bytes: u64,
+    target: &str,
+    path: &str,
+    owner: &str,
+    total_files: usize,
+    uploaded: usize,
+    failed: usize,
+    archive_bytes: u64,
+) {
+    println!(
+        "ts={} event=access ip={} status={} bytes={} method=POST target={} path={} owner={} archive_files={} uploaded={} failed={} archive_bytes={}",
+        logging::format_log_timestamp(timestamp),
+        logging::logfmt_string(client_ip),
+        status.as_u16(),
+        uploaded_bytes,
+        logging::logfmt_string(target),
+        logging::logfmt_string(path),
+        logging::logfmt_string(owner),
+        total_files,
+        uploaded,
+        failed,
+        archive_bytes
+    );
+}
+
+fn log_auth_error(message: &str, client_info: &str) {
+    eprintln!(
+        "ts={} level=warn event=auth msg={} {}",
+        logging::format_log_timestamp(SystemTime::now()),
+        logging::logfmt_string(message),
+        client_info
+    );
 }
 
 pub fn get_config_content() -> String {
@@ -1079,22 +1148,19 @@ async fn ax_post_archive(
 
     let client_ip = client_ip_from_headers(&headers, remote_addr);
     let timestamp = std::time::SystemTime::now();
-    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
     let request_target = original_uri.to_string();
-    println!(
-        "{} {} {} {} {} {} {} {} archive files={} uploaded={} failed={} archive_bytes={}",
-        client_ip,
-        response_status.as_u16(),
+    log_archive_access(
+        timestamp,
+        &client_ip,
+        response_status,
         uploaded_bytes,
-        human_time,
-        Method::POST,
-        request_target,
-        path,
-        owner,
+        &request_target,
+        &path,
+        &owner,
         total_files,
         uploaded,
         failures.len(),
-        archive_upload_bytes
+        archive_upload_bytes,
     );
 
     archive_json_response(
@@ -1336,18 +1402,17 @@ async fn ax_post_file(
                     let status = StatusCode::OK;
                     let client_ip = client_ip_from_headers(&headers, remote_addr);
                     let timestamp = std::time::SystemTime::now();
-                    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
                     let request_target = original_uri.to_string();
-                    println!(
-                        "{} {} {} {} {} {} {} {}",
-                        client_ip,
-                        status.as_u16(),
-                        file_size,
-                        human_time,
-                        Method::POST,
-                        request_target,
-                        full_path,
-                        owner
+                    log_access(
+                        timestamp,
+                        &client_ip,
+                        status,
+                        file_size as u64,
+                        Method::POST.as_str(),
+                        &request_target,
+                        &full_path,
+                        "owner",
+                        &owner,
                     );
 
                     upload_result = Some((status, Vec::new()));
@@ -1456,18 +1521,17 @@ async fn ax_post_file(
             let status = StatusCode::OK;
             let client_ip = client_ip_from_headers(&headers, remote_addr);
             let timestamp = std::time::SystemTime::now();
-            let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
             let request_target = original_uri.to_string();
-            println!(
-                "{} {} {} {} {} {} {} {} buggyclient",
-                client_ip,
-                status.as_u16(),
-                file_size,
-                human_time,
-                Method::POST,
-                request_target,
-                full_path,
-                owner
+            log_access(
+                timestamp,
+                &client_ip,
+                status,
+                file_size as u64,
+                Method::POST.as_str(),
+                &request_target,
+                &full_path,
+                "owner",
+                &owner,
             );
 
             return (status, Vec::new());
@@ -1516,7 +1580,6 @@ async fn ax_get_file(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let timestamp = std::time::SystemTime::now();
-    let human_time = chrono::DateTime::<chrono::Utc>::from(timestamp);
     let user_agent = rxheaders.get("User-Agent");
     let user_agent_str = match user_agent {
         Some(user_agent) => user_agent.to_str().unwrap(),
@@ -1547,9 +1610,16 @@ async fn ax_get_file(
     cleanup_semaphore(&state.file_locks, &filepath).await;
 
     if !received_file.valid {
-        println!(
-            "{} 404 0 {} {} {} {}",
-            client_ip, human_time, method, filepath, user_agent_str
+        log_access(
+            timestamp,
+            &client_ip,
+            StatusCode::NOT_FOUND,
+            0,
+            method.as_str(),
+            &filepath,
+            &filepath,
+            "ua",
+            user_agent_str,
         );
         return (StatusCode::NOT_FOUND, format!("Not Found: {}", filepath)).into_response();
     }
@@ -1594,9 +1664,16 @@ async fn ax_get_file(
         }
         if let Some(etag) = upstream_headers.get(ETAG) {
             if if_none_match == etag {
-                println!(
-                    "{} 304 0 {} {} {} {}",
-                    client_ip, human_time, method, filepath, user_agent_str
+                log_access(
+                    timestamp,
+                    &client_ip,
+                    StatusCode::NOT_MODIFIED,
+                    0,
+                    method.as_str(),
+                    &filepath,
+                    &filepath,
+                    "ua",
+                    user_agent_str,
                 );
                 return (StatusCode::NOT_MODIFIED, headers, Body::empty()).into_response();
             }
@@ -1606,9 +1683,16 @@ async fn ax_get_file(
         if let Some(last_modified) = upstream_headers.get(LAST_MODIFIED) {
             // TODO: Validate properly last_modified
             if if_modified_since == last_modified {
-                println!(
-                    "{} 304 0 {} {} {} {}",
-                    client_ip, human_time, method, filepath, user_agent_str
+                log_access(
+                    timestamp,
+                    &client_ip,
+                    StatusCode::NOT_MODIFIED,
+                    0,
+                    method.as_str(),
+                    &filepath,
+                    &filepath,
+                    "ua",
+                    user_agent_str,
                 );
                 return (StatusCode::NOT_MODIFIED, headers, Body::empty()).into_response();
             }
@@ -1620,9 +1704,16 @@ async fn ax_get_file(
         if let Ok(val) = header::HeaderValue::from_str(&metadata.len().to_string()) {
             headers.insert(header::CONTENT_LENGTH, val);
         }
-        println!(
-            "{} 200 0 {} {} {} {}",
-            client_ip, human_time, method, filepath, user_agent_str
+        log_access(
+            timestamp,
+            &client_ip,
+            StatusCode::OK,
+            0,
+            method.as_str(),
+            &filepath,
+            &filepath,
+            "ua",
+            user_agent_str,
         );
         return (headers, Body::empty()).into_response();
     }
@@ -1676,29 +1767,45 @@ async fn ax_get_file(
             //println!("Headers: {:?}", headers);
             if start != 0 {
                 let body_size = end - start;
-                println!(
-                    "{} 206 {} {} {} {} {}",
-                    client_ip, body_size, human_time, method, filepath, user_agent_str
+                log_access(
+                    timestamp,
+                    &client_ip,
+                    StatusCode::PARTIAL_CONTENT,
+                    body_size,
+                    method.as_str(),
+                    &filepath,
+                    &filepath,
+                    "ua",
+                    user_agent_str,
                 );
                 (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response()
             } else {
-                println!(
-                    "{} 200 {} {} {} {} {}",
-                    client_ip,
+                log_access(
+                    timestamp,
+                    &client_ip,
+                    StatusCode::OK,
                     metadata.len(),
-                    human_time,
-                    method,
-                    filepath,
-                    user_agent_str
+                    method.as_str(),
+                    &filepath,
+                    &filepath,
+                    "ua",
+                    user_agent_str,
                 );
                 (StatusCode::OK, headers, axbody).into_response()
             }
         }
         Err(_) => {
             eprintln!("Error opening file in ax_get_file");
-            println!(
-                "{} 404 0 {} {} {} {}",
-                client_ip, human_time, method, filepath, user_agent_str
+            log_access(
+                timestamp,
+                &client_ip,
+                StatusCode::NOT_FOUND,
+                0,
+                method.as_str(),
+                &filepath,
+                &filepath,
+                "ua",
+                user_agent_str,
             );
             (StatusCode::NOT_FOUND, headers, Body::empty()).into_response()
         }
@@ -1743,7 +1850,11 @@ fn client_info_str(headers: &HeaderMap, fallback: SocketAddr) -> String {
         .get("User-Agent")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    format!("ip={} ua=\"{}\"", client_ip, user_agent)
+    format!(
+        "ip={} ua={}",
+        logging::logfmt_string(&client_ip),
+        logging::logfmt_string(user_agent)
+    )
 }
 
 /// Verify the Authorization header
@@ -1752,20 +1863,20 @@ fn verify_auth_hdr(headers: &HeaderMap, client_info: &str) -> Result<String, Opt
     let auth = match headers.get("Authorization") {
         Some(auth) => auth,
         None => {
-            eprintln!("Missing Authorization header {}", client_info);
+            log_auth_error("Missing Authorization header", client_info);
             return Err(None);
         }
     };
     let auth_str = match auth.to_str() {
         Ok(s) => s,
         Err(_) => {
-            eprintln!("Invalid Authorization header {}", client_info);
+            log_auth_error("Invalid Authorization header", client_info);
             return Err(None);
         }
     };
     let token_parts: Vec<&str> = auth_str.split_whitespace().collect();
     if token_parts.is_empty() {
-        eprintln!("Empty Authorization header {}", client_info);
+        log_auth_error("Empty Authorization header", client_info);
         return Err(None);
     }
     if token_parts.len() != 2 {
@@ -1773,7 +1884,7 @@ fn verify_auth_hdr(headers: &HeaderMap, client_info: &str) -> Result<String, Opt
         let bmap = match verif_result {
             Ok(bmap) => bmap.clone(),
             Err(_) => {
-                eprintln!("Error verifying token {}", client_info);
+                log_auth_error("Error verifying token", client_info);
                 return Err(None);
             }
         };
@@ -1787,7 +1898,7 @@ fn verify_auth_hdr(headers: &HeaderMap, client_info: &str) -> Result<String, Opt
     let bmap = match verif_result {
         Ok(bmap) => bmap.clone(),
         Err(_) => {
-            eprintln!("Error verifying bearer token {}", client_info);
+            log_auth_error("Error verifying bearer token", client_info);
             return Err(None);
         }
     };
