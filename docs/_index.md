@@ -28,7 +28,9 @@ Upload and unpack a tar archive. Requires JWT authentication.
 - `path`: The destination prefix for extracted files
 - `archive`: The `.tar`, `.tar.gz`, `.tgz`, `.tar.zst`, `.tzst`, `.tar.xz`, or `.txz` archive to upload
 
-Only regular files are accepted from the archive. Absolute paths, parent-directory traversal, links, devices, and other special entries are rejected. Extracted files are uploaded as normal backend objects with the same owner and retention handling as single-file uploads. The server uploads extracted files with limited parallelism; set `KCI_STORAGE_ARCHIVE_PARALLELISM` to tune it.
+Only regular files are accepted from the archive. Absolute paths, parent-directory traversal, links, devices, and other special entries are rejected. Extracted files are uploaded as normal backend objects with the same owner and retention handling as single-file uploads. The server uploads extracted files with limited parallelism (default 16); set `KCI_STORAGE_ARCHIVE_PARALLELISM` to tune it.
+
+The request completes only after every extracted file has been uploaded to the backend, so large archives (e.g. ~1k files) can take minutes. If the endpoint sits behind a reverse proxy, raise the proxy's upstream header/read timeout for `/v1/archive` accordingly — for nginx, `proxy_read_timeout` (default 60s) is what triggers `upstream timed out while reading response header`. Higher `KCI_STORAGE_ARCHIVE_PARALLELISM` reduces the wall-clock time but raises peak memory (each concurrent upload holds a 10MB chunk buffer).
 
 ### Download
 

@@ -104,7 +104,13 @@ struct AppState {
 const ARCHIVE_MAX_FILES: usize = 10_000;
 const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ARCHIVE_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
-const ARCHIVE_DEFAULT_PARALLELISM: usize = 4;
+// Each archive entry costs ~3 Azure round-trips (put_block, put_block_list,
+// set_tags), so uploads are latency-bound; a small default serializes large
+// batches (e.g. 1k files) past the reverse-proxy header timeout. Raised to 16
+// to keep big batches under typical proxy limits. Note each concurrent upload
+// allocates a 10MB chunk buffer, so this trades ~160MB peak memory for speed;
+// tune via KCI_STORAGE_ARCHIVE_PARALLELISM.
+const ARCHIVE_DEFAULT_PARALLELISM: usize = 16;
 
 struct ExtractedArchiveEntry {
     storage_path: String,
