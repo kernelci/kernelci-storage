@@ -525,8 +525,21 @@ async fn ax_metrics() -> (StatusCode, String) {
     (StatusCode::OK, metrics)
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Use at least 16 worker threads, or one per core when the machine has more.
+    let worker_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .max(16);
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     logging::init(get_args().verbose);
     tracing_subscriber::fmt::init();
     let tlscfg = initial_setup().await;
