@@ -16,6 +16,7 @@ mod local;
 mod logging;
 mod storcaching;
 mod storjwt;
+mod useragent;
 
 use async_trait::async_trait;
 use axum::{
@@ -369,7 +370,7 @@ pub fn get_retention_tag() -> Option<(String, String)> {
     Some((key.to_string(), value.to_string()))
 }
 
-fn client_ip_from_headers(headers: &HeaderMap, fallback: SocketAddr) -> String {
+pub(crate) fn client_ip_from_headers(headers: &HeaderMap, fallback: SocketAddr) -> String {
     if let Some(forwarded_for) = headers
         .get("X-Forwarded-For")
         .and_then(|value| value.to_str().ok())
@@ -568,6 +569,8 @@ async fn async_main() {
         .route("/v1/list", get(ax_list_files))
         .route("/metrics", get(ax_metrics))
         .layer(ServiceBuilder::new().layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 4)))
+        // Reject banned User-Agents (crawlers, AI agents) before any handler runs.
+        .layer(axum::middleware::from_fn(useragent::ban_middleware))
         .with_state(state);
 
     /*
