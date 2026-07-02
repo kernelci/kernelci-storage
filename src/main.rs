@@ -561,6 +561,7 @@ async fn async_main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/favicon.ico", get(get_favicon))
+        .route("/robots.txt", get(get_robots_txt))
         .route("/v1/checkauth", get(ax_check_auth))
         .route("/v1/file", post(ax_post_file))
         .route("/v1/archive", post(ax_post_archive))
@@ -597,6 +598,25 @@ async fn async_main() {
 
 async fn root() -> &'static str {
     "KernelCI Storage Server"
+}
+
+/// Prohibitive robots.txt served at /robots.txt.
+///
+/// Disallows crawling for every crawler. Lesser search engines, AI agents, and
+/// SEO crawlers are additionally hard-blocked by User-Agent (403 Forbidden);
+/// see the `useragent` module.
+const ROBOTS_TXT: &str = "\
+# Crawling is disallowed for all robots. Lesser search engines, AI agents, and
+# SEO crawlers are additionally hard-blocked by User-Agent (403 Forbidden).
+User-agent: *
+Disallow: /
+";
+
+async fn get_robots_txt() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        ROBOTS_TXT,
+    )
 }
 
 /// Redirect favicon.ico to https://kernelci.org/favicon.ico

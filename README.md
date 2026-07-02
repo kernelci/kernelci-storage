@@ -83,6 +83,11 @@ defaults = true
 The effective list is read once at startup and cached, so restart the server to
 apply changes.
 
+In addition, the server serves a prohibitive `/robots.txt` (`User-agent: *` /
+`Disallow: /`) that asks every crawler to stay out. (The User-Agent ban is the
+hard enforcement; robots.txt is the polite request layer for crawlers that
+honour it.)
+
 ## Creating user tokens
 
 The server uses JWT token based authentication. The token is passed in the `Authorization` header as a Bearer token.
