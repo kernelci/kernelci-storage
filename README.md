@@ -54,6 +54,40 @@ cleanup_chunk_size = 100000  # Defaults to 100000
 
 Larger chunk sizes reclaim space faster when the cache is far above the limit, while smaller chunks reduce the amount of data removed per iteration.
 
+### Banning User-Agents
+
+To keep out web crawlers, scrapers, and AI agents, requests are rejected by
+`User-Agent` header. Any request whose `User-Agent` contains one of the banned
+substrings (case-insensitive) is answered with `403 Forbidden` before it
+reaches any handler, and the rejection is logged.
+
+A curated **built-in list is always applied**. It blocks the common "lesser"
+search-engine crawlers (Yandex, Baidu, DuckDuckGo, Yahoo, Sogou, Seznam, Naver,
+Qwant, Petal, ...), common AI scrapers (GPTBot, CCBot, ClaudeBot,
+PerplexityBot, Bytespider, ...), and SEO/marketing crawlers (AhrefsBot,
+SemrushBot, MJ12bot, DotBot, BLEXBot, ...), while **always allowing Google (`Googlebot`)
+and Microsoft (`bingbot`/`msnbot`)** so artifacts stay indexable by the two
+major engines.
+
+You can extend the built-in list, or turn it off entirely, via the optional
+`[useragent]` section:
+
+```toml
+[useragent]
+# Extra case-insensitive substrings to ban, on top of the built-in list.
+ban = ["SomeOtherBot", "AnotherScraper"]
+# Set to false to disable the built-in list and ban only the substrings above.
+defaults = true
+```
+
+The effective list is read once at startup and cached, so restart the server to
+apply changes.
+
+In addition, the server serves a prohibitive `/robots.txt` (`User-agent: *` /
+`Disallow: /`) that asks every crawler to stay out. (The User-Agent ban is the
+hard enforcement; robots.txt is the polite request layer for crawlers that
+honour it.)
+
 ## Creating user tokens
 
 The server uses JWT token based authentication. The token is passed in the `Authorization` header as a Bearer token.

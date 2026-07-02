@@ -7,6 +7,14 @@ storage_path="./test-storage"
 [cache]
 cleanup_chunk_size=100000
 
+# A built-in list already blocks lesser search-engine crawlers (Yandex, Baidu,
+# DuckDuckGo, Yahoo, Sogou, ...), AI scrapers, and SEO crawlers (AhrefsBot,
+# SemrushBot, MJ12bot, ...), while always allowing Google and Microsoft
+# (Bing/MSN). Optionally extend or disable it below. Restart to apply changes.
+#[useragent]
+#ban = ["SomeOtherBot", "AnotherScraper"]  # extra substrings to ban
+#defaults = true                            # set false to drop the built-in list
+
 # Optional: tag all new uploads so backend lifecycle rules can expire them
 #[retention]
 #tag_key = "retention"  # optional, defaults to "retention"
