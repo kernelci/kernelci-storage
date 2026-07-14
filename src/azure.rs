@@ -211,14 +211,28 @@ async fn write_file_to_blob_streaming(
     let blob_client = azure_blob_client(filename.as_str());
 
     let chunk_size = 10 * 1024 * 1024; // 10MB chunks
-    let mut buffer = vec![0u8; chunk_size];
-    let first_len = match read_full_chunk(data, &mut buffer).await {
+    // Probe with a small buffer first so many parallel small-file uploads
+    // (the common archive case) don't each pin a 10MB allocation; only grow
+    // to a full chunk when the file turns out to be larger than the probe.
+    let probe_size = 256 * 1024;
+    let mut buffer = vec![0u8; probe_size];
+    let mut first_len = match read_full_chunk(data, &mut buffer).await {
         Ok(n) => n,
         Err(e) => {
             eprintln!("Error reading stream: {:?}", e);
             return ("OK", 0);
         }
     };
+    if first_len == probe_size {
+        buffer.resize(chunk_size, 0);
+        first_len += match read_full_chunk(data, &mut buffer[probe_size..]).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("Error reading stream: {:?}", e);
+                return ("OK", 0);
+            }
+        };
+    }
 
     // Whole file fits in one chunk: upload with single-shot Put Blob (one
     // round-trip) instead of put_block + put_block_list.
