@@ -182,6 +182,25 @@ fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
     Some(tags)
 }
 
+/// Read from the stream until the buffer is full or EOF is reached. A single
+/// read() may return far less than the buffer size (e.g. one multipart
+/// network chunk), which would otherwise turn every ~64KB into its own
+/// put_block round-trip.
+async fn read_full_chunk(
+    data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = data.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
 /// Write file to Azure blob storage using streaming (new version)
 async fn write_file_to_blob_streaming(
     filename: String,
@@ -191,39 +210,77 @@ async fn write_file_to_blob_streaming(
 ) -> (&'static str, usize) {
     let blob_client = azure_blob_client(filename.as_str());
 
-    let mut total_bytes_uploaded: usize = 0;
     let chunk_size = 10 * 1024 * 1024; // 10MB chunks
+    let mut buffer = vec![0u8; chunk_size];
+    let first_len = match read_full_chunk(data, &mut buffer).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error reading stream: {:?}", e);
+            return ("OK", 0);
+        }
+    };
+
+    // Whole file fits in one chunk: upload with single-shot Put Blob (one
+    // round-trip) instead of put_block + put_block_list.
+    if first_len < chunk_size {
+        buffer.truncate(first_len);
+        match blob_client
+            .put_block_blob(buffer)
+            .content_type(cont_type)
+            .await
+        {
+            Ok(_) => {
+                debug_log!("Uploaded {} bytes via put_blob", first_len);
+                // Set upload tags (owner + retention); set_tags replaces the
+                // whole tag set, so all tags must go in a single call
+                if let Some(tags) = upload_tags(owner_email) {
+                    match blob_client.set_tags(tags).await {
+                        Ok(_) => {
+                            debug_log!("Upload tags set successfully");
+                        }
+                        Err(e) => {
+                            eprintln!("Error setting upload tags: {:?}", e);
+                        }
+                    }
+                }
+                return ("OK", first_len);
+            }
+            Err(e) => {
+                eprintln!("Error uploading blob: {:?}", e);
+                return ("OK", 0);
+            }
+        }
+    }
+
+    // Larger file: stream it as a list of blocks
+    let mut total_bytes_uploaded: usize = 0;
+    let mut chunk_len = first_len;
     let mut blocks = BlockList::default();
 
-    loop {
-        let mut buffer = vec![0u8; chunk_size];
-        let bytes_read = data.read(&mut buffer).await;
-        match bytes_read {
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    break;
-                }
-                buffer.truncate(bytes_read);
-                let block_id = BlockId::new(hex::encode(total_bytes_uploaded.to_le_bytes()));
-                blocks
-                    .blocks
-                    .push(BlobBlockType::Uncommitted(block_id.clone()));
-                match blob_client.put_block(block_id, buffer).await {
-                    Ok(_) => {
-                        total_bytes_uploaded += bytes_read;
-                        debug_log!("Uploaded {} bytes", total_bytes_uploaded);
-                    }
-                    Err(e) => {
-                        eprintln!("Error uploading block: {:?}", e);
-                        break;
-                    }
-                }
+    while chunk_len > 0 {
+        buffer.truncate(chunk_len);
+        let block_id = BlockId::new(hex::encode(total_bytes_uploaded.to_le_bytes()));
+        blocks
+            .blocks
+            .push(BlobBlockType::Uncommitted(block_id.clone()));
+        match blob_client.put_block(block_id, buffer).await {
+            Ok(_) => {
+                total_bytes_uploaded += chunk_len;
+                debug_log!("Uploaded {} bytes", total_bytes_uploaded);
             }
+            Err(e) => {
+                eprintln!("Error uploading block: {:?}", e);
+                break;
+            }
+        }
+        buffer = vec![0u8; chunk_size];
+        chunk_len = match read_full_chunk(data, &mut buffer).await {
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("Error reading stream: {:?}", e);
                 break;
             }
-        }
+        };
     }
     match blob_client
         .put_block_list(blocks)
