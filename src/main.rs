@@ -105,13 +105,14 @@ struct AppState {
 const ARCHIVE_MAX_FILES: usize = 10_000;
 const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ARCHIVE_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
-// Each archive entry costs ~3 Azure round-trips (put_block, put_block_list,
-// set_tags), so uploads are latency-bound; a small default serializes large
-// batches (e.g. 1k files) past the reverse-proxy header timeout. Raised to 16
-// to keep big batches under typical proxy limits. Note each concurrent upload
-// allocates a 10MB chunk buffer, so this trades ~160MB peak memory for speed;
-// tune via KCI_STORAGE_ARCHIVE_PARALLELISM.
-const ARCHIVE_DEFAULT_PARALLELISM: usize = 16;
+// Archive uploads are latency-bound: each small file costs one Azure
+// round-trip (single-shot Put Blob over a pooled connection), so throughput
+// scales almost linearly with concurrency. Azure Blob comfortably handles
+// hundreds of concurrent requests; 64 keeps multi-thousand-file archives
+// well under reverse-proxy timeouts. Memory stays modest because small
+// uploads use a 256KB probe buffer and only files larger than that grow to
+// a 10MB chunk buffer; tune via KCI_STORAGE_ARCHIVE_PARALLELISM.
+const ARCHIVE_DEFAULT_PARALLELISM: usize = 64;
 
 struct ExtractedArchiveEntry {
     storage_path: String,

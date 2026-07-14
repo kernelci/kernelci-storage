@@ -15,7 +15,9 @@ use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::container::operations::BlobItem;
-use azure_storage_blobs::prelude::{BlobBlockType, BlockId, BlockList, ClientBuilder, Tags};
+use azure_storage_blobs::prelude::{
+    BlobBlockType, BlobClient, BlockId, BlockList, ClientBuilder, ContainerClient, Tags,
+};
 use chksum_hash_sha2_512 as sha2_512;
 use futures::stream::StreamExt;
 use headers::HeaderMap;
@@ -25,7 +27,7 @@ use std::fs::read_to_string;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use tempfile::Builder;
 use tokio::io::AsyncReadExt;
 use toml::Table;
@@ -81,6 +83,30 @@ fn get_azure_credentials(name: &str) -> AzureConfig {
         container: container.to_string(),
         sastoken: normalize_sas_token(sastoken),
     }
+}
+
+/// Shared container client so every blob operation reuses one HTTP
+/// connection pool. Building a ClientBuilder per operation creates a fresh
+/// HTTP client each time, which costs a TCP+TLS handshake per request and
+/// dominates latency when uploading many small files.
+fn azure_container_client() -> &'static ContainerClient {
+    static CLIENT: OnceLock<ContainerClient> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        let cfg = get_azure_credentials("azure");
+        let credential = StorageCredentials::access_key(cfg.account.as_str(), cfg.key.clone());
+        ClientBuilder::new(cfg.account.clone(), credential).container_client(cfg.container.clone())
+    })
+}
+
+fn azure_blob_client(blob: &str) -> BlobClient {
+    azure_container_client().blob_client(blob)
+}
+
+/// Shared client for plain HTTP downloads (SAS URL fetches), pooled for the
+/// same reason as azure_container_client.
+fn http_client() -> &'static Client {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    CLIENT.get_or_init(Client::new)
 }
 
 #[allow(dead_code)]
@@ -156,6 +182,25 @@ fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
     Some(tags)
 }
 
+/// Read from the stream until the buffer is full or EOF is reached. A single
+/// read() may return far less than the buffer size (e.g. one multipart
+/// network chunk), which would otherwise turn every ~64KB into its own
+/// put_block round-trip.
+async fn read_full_chunk(
+    data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = data.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
 /// Write file to Azure blob storage using streaming (new version)
 async fn write_file_to_blob_streaming(
     filename: String,
@@ -163,49 +208,93 @@ async fn write_file_to_blob_streaming(
     cont_type: String,
     owner_email: Option<String>,
 ) -> (&'static str, usize) {
-    let azure_cfg = Arc::new(get_azure_credentials("azure"));
+    let blob_client = azure_blob_client(filename.as_str());
 
-    let storage_account = azure_cfg.account.as_str();
-    let storage_key = azure_cfg.key.clone();
-    let storage_container = azure_cfg.container.as_str();
-    let storage_blob = filename.as_str();
-    let storage_credential = StorageCredentials::access_key(storage_account, storage_key);
-    let blob_client = ClientBuilder::new(storage_account, storage_credential)
-        .blob_client(storage_container, storage_blob);
-
-    let mut total_bytes_uploaded: usize = 0;
     let chunk_size = 10 * 1024 * 1024; // 10MB chunks
+    // Probe with a small buffer first so many parallel small-file uploads
+    // (the common archive case) don't each pin a 10MB allocation; only grow
+    // to a full chunk when the file turns out to be larger than the probe.
+    let probe_size = 256 * 1024;
+    let mut buffer = vec![0u8; probe_size];
+    let mut first_len = match read_full_chunk(data, &mut buffer).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Error reading stream: {:?}", e);
+            return ("OK", 0);
+        }
+    };
+    if first_len == probe_size {
+        buffer.resize(chunk_size, 0);
+        first_len += match read_full_chunk(data, &mut buffer[probe_size..]).await {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("Error reading stream: {:?}", e);
+                return ("OK", 0);
+            }
+        };
+    }
+
+    // Whole file fits in one chunk: upload with single-shot Put Blob (one
+    // round-trip) instead of put_block + put_block_list.
+    if first_len < chunk_size {
+        buffer.truncate(first_len);
+        match blob_client
+            .put_block_blob(buffer)
+            .content_type(cont_type)
+            .await
+        {
+            Ok(_) => {
+                debug_log!("Uploaded {} bytes via put_blob", first_len);
+                // Set upload tags (owner + retention); set_tags replaces the
+                // whole tag set, so all tags must go in a single call
+                if let Some(tags) = upload_tags(owner_email) {
+                    match blob_client.set_tags(tags).await {
+                        Ok(_) => {
+                            debug_log!("Upload tags set successfully");
+                        }
+                        Err(e) => {
+                            eprintln!("Error setting upload tags: {:?}", e);
+                        }
+                    }
+                }
+                return ("OK", first_len);
+            }
+            Err(e) => {
+                eprintln!("Error uploading blob: {:?}", e);
+                return ("OK", 0);
+            }
+        }
+    }
+
+    // Larger file: stream it as a list of blocks
+    let mut total_bytes_uploaded: usize = 0;
+    let mut chunk_len = first_len;
     let mut blocks = BlockList::default();
 
-    loop {
-        let mut buffer = vec![0u8; chunk_size];
-        let bytes_read = data.read(&mut buffer).await;
-        match bytes_read {
-            Ok(bytes_read) => {
-                if bytes_read == 0 {
-                    break;
-                }
-                buffer.truncate(bytes_read);
-                let block_id = BlockId::new(hex::encode(total_bytes_uploaded.to_le_bytes()));
-                blocks
-                    .blocks
-                    .push(BlobBlockType::Uncommitted(block_id.clone()));
-                match blob_client.put_block(block_id, buffer).await {
-                    Ok(_) => {
-                        total_bytes_uploaded += bytes_read;
-                        debug_log!("Uploaded {} bytes", total_bytes_uploaded);
-                    }
-                    Err(e) => {
-                        eprintln!("Error uploading block: {:?}", e);
-                        break;
-                    }
-                }
+    while chunk_len > 0 {
+        buffer.truncate(chunk_len);
+        let block_id = BlockId::new(hex::encode(total_bytes_uploaded.to_le_bytes()));
+        blocks
+            .blocks
+            .push(BlobBlockType::Uncommitted(block_id.clone()));
+        match blob_client.put_block(block_id, buffer).await {
+            Ok(_) => {
+                total_bytes_uploaded += chunk_len;
+                debug_log!("Uploaded {} bytes", total_bytes_uploaded);
             }
+            Err(e) => {
+                eprintln!("Error uploading block: {:?}", e);
+                break;
+            }
+        }
+        buffer = vec![0u8; chunk_size];
+        chunk_len = match read_full_chunk(data, &mut buffer).await {
+            Ok(n) => n,
             Err(e) => {
                 eprintln!("Error reading stream: {:?}", e);
                 break;
             }
-        }
+        };
     }
     match blob_client
         .put_block_list(blocks)
@@ -253,11 +342,6 @@ async fn write_file_to_blob(
     cont_type: String,
     owner_email: Option<String>,
 ) -> &'static str {
-    let azure_cfg = Arc::new(get_azure_credentials("azure"));
-
-    let storage_account = azure_cfg.account.as_str();
-    let storage_key = azure_cfg.key.clone();
-    let storage_container = azure_cfg.container.as_str();
     /* store data in temporary file, filename is just hexadecimal file name */
     let folder = Builder::new().prefix("temp").tempdir_in("./").unwrap();
     let file_path = folder.path().display().to_string();
@@ -270,10 +354,7 @@ async fn write_file_to_blob(
     // TODO: Is there simpler way? Maybe just rewind the file to beginning?
     let mut f = f_write.reopen().unwrap();
     //let fname_str = f.path().display().to_string();
-    let storage_blob = filename.as_str();
-    let storage_credential = StorageCredentials::access_key(storage_account, storage_key);
-    let blob_client = ClientBuilder::new(storage_account, storage_credential)
-        .blob_client(storage_container, storage_blob);
+    let blob_client = azure_blob_client(filename.as_str());
 
     let mut total_bytes_uploaded: usize = 0;
     let chunk_size = 10;
@@ -382,16 +463,10 @@ fn save_headers_to_file(filename: String, headers: HeaderMap) {
 
 /// Get file from Azure blob storage
 async fn get_file_from_blob(filename: String) -> ReceivedFile {
-    let azure_cfg = Arc::new(get_azure_credentials("azure"));
+    let azure_cfg = get_azure_credentials("azure");
     //println!("get_file_from_blob {}", filename);
-    let storage_account = azure_cfg.account.as_str();
-    let storage_key = azure_cfg.key.clone();
-    let storage_container = azure_cfg.container.as_str();
     let storage_sastoken = azure_cfg.sastoken.as_str();
-    let storage_blob = filename.as_str();
-    let storage_credential = StorageCredentials::access_key(storage_account, storage_key);
-    let blob_client = ClientBuilder::new(storage_account, storage_credential)
-        .blob_client(storage_container, storage_blob);
+    let blob_client = azure_blob_client(filename.as_str());
     let blob_url_res = blob_client.url();
     let mut received_file = ReceivedFile {
         original_filename: "".to_string(),
@@ -481,8 +556,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
         cache_filename,
         blob_url
     );
-    let client = Client::new();
-    let response = client.get(blob_url).send().await;
+    let response = http_client().get(blob_url).send().await;
     match response {
         Ok(response) => {
             debug_log!("Azure response: {:?}", response);
@@ -551,14 +625,7 @@ async fn azure_set_filename_tags(
     filename: String,
     user_tags: Vec<(String, String)>,
 ) -> Result<String, String> {
-    let azure_cfg = Arc::new(get_azure_credentials("azure"));
-    let storage_account = azure_cfg.account.as_str();
-    let storage_key = azure_cfg.key.clone();
-    let storage_container = azure_cfg.container.as_str();
-    let storage_blob = filename.as_str();
-    let storage_credential = StorageCredentials::access_key(storage_account, storage_key);
-    let blob_client = ClientBuilder::new(storage_account, storage_credential)
-        .blob_client(storage_container, storage_blob);
+    let blob_client = azure_blob_client(filename.as_str());
     let mut tags = Tags::new();
     // Iterate and add tags after sanitizing key and value
     for (key, value) in user_tags {
@@ -593,14 +660,7 @@ async fn azure_set_filename_tags(
 
 #[allow(dead_code)]
 async fn azure_list_files(_directory: String) -> Vec<String> {
-    let azure_cfg = Arc::new(get_azure_credentials("azure"));
-    let storage_account = azure_cfg.account.as_str();
-    let storage_key = azure_cfg.key.clone();
-    let storage_container = azure_cfg.container.as_str();
-    let storage_credential = StorageCredentials::access_key(storage_account, storage_key);
-    let container_r =
-        ClientBuilder::new(storage_account, storage_credential).container_client(storage_container);
-    let listbldr = container_r.list_blobs();
+    let listbldr = azure_container_client().list_blobs();
     let mut liststream = listbldr.into_stream();
     let mut listing = Vec::new();
     while let Some(Ok(page)) = liststream.next().await {
