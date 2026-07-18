@@ -11,6 +11,7 @@
 */
 
 mod azure;
+mod download_challenge;
 mod local;
 #[macro_use]
 mod logging;
@@ -593,6 +594,10 @@ async fn async_main() {
         eprintln!("Invalid block_subnets configuration: {error}");
         std::process::exit(1);
     });
+    download_challenge::init().unwrap_or_else(|error| {
+        eprintln!("Invalid download_challenge configuration: {error}");
+        std::process::exit(1);
+    });
     let port: u16 = std::env::var("KCI_STORAGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -612,6 +617,10 @@ async fn async_main() {
         .route("/favicon.ico", get(get_favicon))
         .route("/robots.txt", get(get_robots_txt))
         .route("/v1/checkauth", get(ax_check_auth))
+        .route(
+            "/v1/download-challenge",
+            post(download_challenge::issue_cookie),
+        )
         .route("/v1/file", post(ax_post_file))
         .route("/v1/archive", post(ax_post_archive))
         .route("/upload", post(ax_post_file))
@@ -1661,11 +1670,21 @@ fn filename_from_fullpath(filepath: &str) -> String {
 #[axum::debug_handler]
 async fn ax_get_file(
     Path(filepath): Path<String>,
+    OriginalUri(original_uri): OriginalUri,
     rxheaders: HeaderMap,
     method: Method,
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let fallback_rate = match download_challenge::authorize_request(
+        &rxheaders,
+        remote_addr,
+        &original_uri,
+    ) {
+        Ok(rate) => rate,
+        Err(response) => return response,
+    };
+
     let timestamp = std::time::SystemTime::now();
     let user_agent = rxheaders.get("User-Agent");
     let user_agent_str = match user_agent {
@@ -1717,6 +1736,11 @@ async fn ax_get_file(
     //let file: tokio::fs::File;
     let metadata = tokio::fs::metadata(&cached_file).await.unwrap();
     let mut headers = HeaderMap::new();
+    if let Some(rate) = fallback_rate {
+        if let Ok(value) = header::HeaderValue::from_str(&rate.to_string()) {
+            headers.insert("x-accel-limit-rate", value);
+        }
+    }
     if let Some(content_type) = upstream_headers.get(CONTENT_TYPE) {
         headers.insert(header::CONTENT_TYPE, content_type.clone());
     } else {

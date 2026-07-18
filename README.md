@@ -110,6 +110,36 @@ When running behind a reverse proxy, ensure it overwrites the forwarded-client
 headers and prevent direct access to the storage origin. The server uses the
 same resolved client IP for access logging and subnet matching.
 
+### Browser Download Challenge
+
+The optional browser challenge gives configured User-Agent patterns a short
+preparation page before downloading. JavaScript requests a server-signed,
+short-lived cookie bound to the client's IPv4 or IPv6 network and then reloads
+the artifact. The feature is disabled when `[download_challenge]` is absent or
+when `user_agents` is empty.
+
+```toml
+[download_challenge]
+user_agents = ["android"]  # case-insensitive substrings
+secret = "replace-with-an-independent-random-secret-of-at-least-32-characters"
+cookie_ttl_seconds = 600   # 30..86400; defaults to 600
+ipv4_prefix_length = 24    # defaults to 24
+ipv6_prefix_length = 64    # defaults to 64
+fallback_bytes_per_second = 262144  # optional; 0 or absent disables fallback
+secure_cookie = true       # keep true in production HTTPS deployments
+```
+
+The cookie is `HttpOnly`, `SameSite=Lax`, and `Secure` by default. The
+preparation page is marked `no-store` and includes a manual fallback only when
+`fallback_bytes_per_second` is configured. Fallback responses carry
+`X-Accel-Limit-Rate`, which Nginx uses to limit response bandwidth. The server
+logs challenged requests as `event=download_challenge`.
+
+This is a lightweight defense against clients that do not execute the browser
+flow, not proof that a client is human. Keep backend concurrency and rate
+limits in place. When using forwarded client-IP headers, the reverse proxy must
+overwrite them and direct origin access must be prevented.
+
 ## Creating user tokens
 
 The server uses JWT token based authentication. The token is passed in the `Authorization` header as a Bearer token.
