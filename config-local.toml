@@ -5,6 +5,18 @@ jwt_secret="test-secret-for-local-storage-testing"
 # one TOML array. Use /32 (IPv4) or /128 (IPv6) to block a single address.
 #block_subnets = ["192.0.2.0/24", "198.51.100.0/24", "2001:db8::/32"]
 
+# Optional browser download challenge. If this section is absent, or
+# user_agents is empty, the feature is disabled. Keep secure_cookie=true in
+# production; false is useful only for local plain-HTTP development.
+#[download_challenge]
+#user_agents = ["android"]
+#secret = "replace-with-an-independent-random-secret-of-at-least-32-characters"
+#cookie_ttl_seconds = 600
+#ipv4_prefix_length = 24
+#ipv6_prefix_length = 64
+#fallback_bytes_per_second = 262144
+#secure_cookie = true
+
 [local]
 storage_path="./test-storage"
 

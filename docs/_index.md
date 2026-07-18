@@ -186,6 +186,29 @@ address or `/128` for one IPv6 address. Matching requests receive `403
 Forbidden` and produce an `event=subnet_ban` warning log. Invalid CIDRs prevent
 startup; restart the server after changing the list.
 
+### Browser Download Challenge
+
+An optional first-party cookie challenge can be enabled for selected
+case-insensitive User-Agent substrings:
+
+```toml
+[download_challenge]
+user_agents = ["android"]
+secret = "replace-with-an-independent-random-secret-of-at-least-32-characters"
+cookie_ttl_seconds = 600
+ipv4_prefix_length = 24
+ipv6_prefix_length = 64
+fallback_bytes_per_second = 262144
+secure_cookie = true
+```
+
+The section is optional: when it is absent, or when `user_agents` is empty,
+downloads behave exactly as before. A matching browser receives a small
+no-store preparation page, obtains a signed cookie bound to its client subnet,
+and reloads the artifact. The optional fallback is delivered with
+`X-Accel-Limit-Rate` for Nginx bandwidth limiting. Use a separate random secret
+and keep `secure_cookie` enabled outside local plain-HTTP development.
+
 ### Cache Housekeeping
 
 The cache directory is capped at 1,000,000 cached artifacts (`*.content` files). When the limit is exceeded—or when disk space drops below 12%—the housekeeping worker deletes the oldest entries in batches. The batch size defaults to 100,000 files and can be overridden in the configuration file:

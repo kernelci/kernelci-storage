@@ -116,6 +116,15 @@ impl TestServer {
             r#"driver="local"
 jwt_secret="{JWT_SECRET}"
 
+[download_challenge]
+user_agents = ["challenge-browser"]
+secret = "0123456789abcdef0123456789abcdef"
+cookie_ttl_seconds = 600
+ipv4_prefix_length = 24
+ipv6_prefix_length = 64
+fallback_bytes_per_second = 262144
+secure_cookie = false
+
 [local]
 storage_path="{}"
 
@@ -305,6 +314,72 @@ fn test_upload_and_download() {
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().unwrap();
     assert_eq!(body.as_ref(), file_content);
+}
+
+#[test]
+fn test_browser_download_challenge_cookie_and_fallback() {
+    let server = TestServer::start();
+    let artifact_dir = server.work_dir.path().join("storage/challenge");
+    std::fs::create_dir_all(&artifact_dir).unwrap();
+    std::fs::write(artifact_dir.join("artifact.bin"), b"challenged download").unwrap();
+
+    let client = server.client();
+    let artifact_url = server.url("/challenge/artifact.bin");
+    let challenged = client
+        .get(&artifact_url)
+        .header("User-Agent", "Challenge-Browser/1.0")
+        .send()
+        .unwrap();
+    assert_eq!(challenged.status(), 200);
+    assert!(challenged
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .starts_with("text/html"));
+    assert!(challenged.text().unwrap().contains("Please wait"));
+
+    let token_response = client
+        .post(server.url("/v1/download-challenge"))
+        .header("User-Agent", "Challenge-Browser/1.0")
+        .send()
+        .unwrap();
+    assert_eq!(token_response.status(), 204);
+    let set_cookie = token_response
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let cookie = set_cookie.split(';').next().unwrap();
+    assert!(cookie.starts_with("kci-download="));
+
+    let downloaded = client
+        .get(&artifact_url)
+        .header("User-Agent", "Challenge-Browser/1.0")
+        .header("Cookie", cookie)
+        .send()
+        .unwrap();
+    assert_eq!(downloaded.status(), 200);
+    assert_eq!(downloaded.bytes().unwrap().as_ref(), b"challenged download");
+
+    let fallback = client
+        .get(format!("{artifact_url}?challenge_fallback=1"))
+        .header("User-Agent", "Challenge-Browser/1.0")
+        .send()
+        .unwrap();
+    assert_eq!(fallback.status(), 200);
+    assert_eq!(
+        fallback
+            .headers()
+            .get("x-accel-limit-rate")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "262144"
+    );
+    assert_eq!(fallback.bytes().unwrap().as_ref(), b"challenged download");
 }
 
 #[test]
