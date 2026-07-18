@@ -14,6 +14,7 @@ mod azure;
 mod local;
 #[macro_use]
 mod logging;
+mod subnet;
 mod storcaching;
 mod storjwt;
 mod useragent;
@@ -588,6 +589,10 @@ async fn async_main() {
     logging::init(get_args().verbose);
     tracing_subscriber::fmt::init();
     let tlscfg = initial_setup().await;
+    subnet::init().unwrap_or_else(|error| {
+        eprintln!("Invalid block_subnets configuration: {error}");
+        std::process::exit(1);
+    });
     let port: u16 = std::env::var("KCI_STORAGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -616,6 +621,8 @@ async fn async_main() {
         .layer(ServiceBuilder::new().layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 4)))
         // Reject banned User-Agents (crawlers, AI agents) before any handler runs.
         .layer(axum::middleware::from_fn(useragent::ban_middleware))
+        // Reject configured client IP subnets before any handler runs.
+        .layer(axum::middleware::from_fn(subnet::block_middleware))
         .with_state(state);
 
     /*

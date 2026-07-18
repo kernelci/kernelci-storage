@@ -1,6 +1,10 @@
 driver="local"
 jwt_secret="test-secret-for-local-storage-testing"
 
+# Optional client IP subnets to reject. List multiple IPv4 or IPv6 CIDRs in
+# one TOML array. Use /32 (IPv4) or /128 (IPv6) to block a single address.
+#block_subnets = ["192.0.2.0/24", "198.51.100.0/24", "2001:db8::/32"]
+
 [local]
 storage_path="./test-storage"
 

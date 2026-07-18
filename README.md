@@ -88,6 +88,28 @@ In addition, the server serves a prohibitive `/robots.txt` (`User-agent: *` /
 hard enforcement; robots.txt is the polite request layer for crawlers that
 honour it.)
 
+### Blocking IP Subnets
+
+Use the optional top-level `block_subnets` setting to reject client addresses
+from one or more IPv4 or IPv6 networks. List multiple CIDRs in a TOML array:
+
+```toml
+block_subnets = [
+    "192.0.2.0/24",
+    "198.51.100.0/24",
+    "2001:db8::/32",
+]
+```
+
+Use a `/32` IPv4 prefix or `/128` IPv6 prefix to block one address. Matching
+requests receive `403 Forbidden` before reaching a handler and are logged as
+`event=subnet_ban`. Invalid CIDRs prevent the server from starting, and a
+restart is required after changing the list.
+
+When running behind a reverse proxy, ensure it overwrites the forwarded-client
+headers and prevent direct access to the storage origin. The server uses the
+same resolved client IP for access logging and subnet matching.
+
 ## Creating user tokens
 
 The server uses JWT token based authentication. The token is passed in the `Authorization` header as a Bearer token.

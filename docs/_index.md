@@ -161,6 +161,9 @@ The server supports configuration through a `config.toml` file with the followin
 driver = "azure"
 jwt_secret = "your-jwt-secret-here"
 
+# Optional IPv4/IPv6 networks to reject before request handling
+block_subnets = ["192.0.2.0/24", "198.51.100.0/24", "2001:db8::/32"]
+
 # Azure Blob Storage configuration
 [azure]
 account = "your-storage-account"
@@ -177,6 +180,11 @@ prefixes = ["/allowed/path1", "/allowed/path2"]
 name = "admin@example.com"
 prefixes = [""]  # Empty prefix allows access to all paths
 ```
+
+`block_subnets` is a top-level array of CIDR strings. Use `/32` for one IPv4
+address or `/128` for one IPv6 address. Matching requests receive `403
+Forbidden` and produce an `event=subnet_ban` warning log. Invalid CIDRs prevent
+startup; restart the server after changing the list.
 
 ### Cache Housekeeping
 
