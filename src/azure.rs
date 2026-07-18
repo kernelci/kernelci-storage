@@ -10,7 +10,7 @@ impl AzureDriver {
     }
 }
 
-use crate::{debug_log, get_config_content, ReceivedFile};
+use crate::{debug_log, get_config_content, CacheState, ReceivedFile};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use azure_storage::StorageCredentials;
@@ -473,6 +473,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
         cached_filename: "".to_string(),
         headers: HeaderMap::new(),
         valid: false,
+        cache_state: CacheState::Uncached,
     };
     received_file.original_filename = filename.clone();
 
@@ -525,6 +526,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             received_file.cached_filename = cache_filename;
             received_file.headers = get_headers_from_file(cache_filename_headers);
             received_file.valid = true;
+            received_file.cache_state = CacheState::Cached;
             return received_file;
         } else {
             // delete cache file and headers

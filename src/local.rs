@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025 Collabora, Ltd.
 // Author: Denys Fedoryshchenko <denys.f@collabora.com>
 
-use crate::{debug_log, get_config_content, ReceivedFile};
+use crate::{debug_log, get_config_content, CacheState, ReceivedFile};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use chksum_hash_sha2_512 as sha2_512;
@@ -246,6 +246,7 @@ fn get_file_from_local(filename: String) -> ReceivedFile {
         cached_filename: String::new(),
         headers: HeaderMap::new(),
         valid: false,
+        cache_state: CacheState::Cached,
     };
 
     // Check if file exists
@@ -403,6 +404,7 @@ impl super::Driver for LocalDriver {
                     cached_filename: String::new(),
                     headers: HeaderMap::new(),
                     valid: false,
+                    cache_state: CacheState::Cached,
                 }
             })
     }
