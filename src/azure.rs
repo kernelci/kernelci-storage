@@ -29,7 +29,7 @@ use std::io::Read;
 use std::io::Write;
 use std::sync::OnceLock;
 use tempfile::Builder;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use toml::Table;
 
 #[derive(Deserialize)]
@@ -558,7 +558,7 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     );
     let response = http_client().get(blob_url).send().await;
     match response {
-        Ok(response) => {
+        Ok(mut response) => {
             debug_log!("Azure response: {:?}", response);
             // is status anything else than 200?
             // TODO: Do we need to return headers as well or it is data leakage?
@@ -597,15 +597,70 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             }
             received_file.headers = response.headers().clone();
             let resp_headers = response.headers().clone();
-            let body = response.bytes().await.unwrap();
             // ensure the shard subdirectory exists before writing into it
             if let Err(e) = crate::storcaching::ensure_shard_dir("cache", &cache_hex) {
                 eprintln!("Error creating cache shard directory: {:?}", e);
                 return received_file;
             }
-            // just write all to cache file
-            let mut f = File::create(&cache_filename).unwrap();
-            f.write_all(&body).unwrap();
+
+            // Stream the response to a temporary file with asynchronous I/O.
+            // Publishing it with an atomic rename prevents readers from seeing
+            // a partial cache entry if the transfer is interrupted.
+            let cache_temp_filename = format!("{}.{}.part", cache_filename, std::process::id());
+            let mut f = match tokio::fs::File::create(&cache_temp_filename).await {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!(
+                        "Error creating temporary cache file {}: {:?}",
+                        cache_temp_filename, e
+                    );
+                    return received_file;
+                }
+            };
+
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) => {
+                        if let Err(e) = f.write_all(&chunk).await {
+                            eprintln!(
+                                "Error writing temporary cache file {}: {:?}",
+                                cache_temp_filename, e
+                            );
+                            drop(f);
+                            let _ = tokio::fs::remove_file(&cache_temp_filename).await;
+                            return received_file;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        eprintln!("Error streaming blob {}: {:?}", filename, e);
+                        drop(f);
+                        let _ = tokio::fs::remove_file(&cache_temp_filename).await;
+                        return received_file;
+                    }
+                }
+            }
+
+            if let Err(e) = f.flush().await {
+                eprintln!(
+                    "Error flushing temporary cache file {}: {:?}",
+                    cache_temp_filename, e
+                );
+                drop(f);
+                let _ = tokio::fs::remove_file(&cache_temp_filename).await;
+                return received_file;
+            }
+            drop(f);
+
+            if let Err(e) = tokio::fs::rename(&cache_temp_filename, &cache_filename).await {
+                eprintln!(
+                    "Error publishing cache file {} as {}: {:?}",
+                    cache_temp_filename, cache_filename, e
+                );
+                let _ = tokio::fs::remove_file(&cache_temp_filename).await;
+                return received_file;
+            }
+
             // write headers
             save_headers_to_file(cache_filename_headers, resp_headers);
             received_file.cached_filename = cache_filename;
