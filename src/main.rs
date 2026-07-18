@@ -149,11 +149,27 @@ async fn cleanup_semaphore(locks: &FileSemaphores, filename: &str) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CacheState {
+    Cached,
+    Uncached,
+}
+
+impl CacheState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Uncached => "uncached",
+        }
+    }
+}
+
 struct ReceivedFile {
     original_filename: String,
     cached_filename: String,
     headers: HeaderMap,
     valid: bool,
+    cache_state: CacheState,
 }
 
 // Wrapper to convert Multipart Field into AsyncRead
@@ -285,6 +301,33 @@ fn log_access(
         logging::logfmt_string(path),
         subject_key,
         logging::logfmt_string(subject_value)
+    );
+}
+
+fn log_access_with_cache_state(
+    timestamp: SystemTime,
+    client_ip: &str,
+    status: StatusCode,
+    bytes: u64,
+    method: &str,
+    target: &str,
+    path: &str,
+    subject_key: &str,
+    subject_value: &str,
+    cache_state: CacheState,
+) {
+    println!(
+        "ts={} event=access ip={} status={} bytes={} method={} target={} path={} {}={} state={}",
+        logging::format_log_timestamp(timestamp),
+        logging::logfmt_string(client_ip),
+        status.as_u16(),
+        bytes,
+        method,
+        logging::logfmt_string(target),
+        logging::logfmt_string(path),
+        subject_key,
+        logging::logfmt_string(subject_value),
+        cache_state.as_str()
     );
 }
 
@@ -1663,6 +1706,7 @@ async fn ax_get_file(
     let cached_file = received_file.cached_filename;
     let original_filename = received_file.original_filename;
     let upstream_headers = received_file.headers;
+    let cache_state = received_file.cache_state;
     //let file: tokio::fs::File;
     let metadata = tokio::fs::metadata(&cached_file).await.unwrap();
     let mut headers = HeaderMap::new();
@@ -1741,7 +1785,7 @@ async fn ax_get_file(
         if let Ok(val) = header::HeaderValue::from_str(&metadata.len().to_string()) {
             headers.insert(header::CONTENT_LENGTH, val);
         }
-        log_access(
+        log_access_with_cache_state(
             timestamp,
             &client_ip,
             StatusCode::OK,
@@ -1751,6 +1795,7 @@ async fn ax_get_file(
             &filepath,
             "ua",
             user_agent_str,
+            cache_state,
         );
         return (headers, Body::empty()).into_response();
     }
@@ -1817,7 +1862,7 @@ async fn ax_get_file(
                 );
                 (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response()
             } else {
-                log_access(
+                log_access_with_cache_state(
                     timestamp,
                     &client_ip,
                     StatusCode::OK,
@@ -1827,6 +1872,7 @@ async fn ax_get_file(
                     &filepath,
                     "ua",
                     user_agent_str,
+                    cache_state,
                 );
                 (StatusCode::OK, headers, axbody).into_response()
             }
