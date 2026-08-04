@@ -38,9 +38,10 @@ use headers::HeaderMap;
 use serde::Serialize;
 use std::io::Read;
 use std::path::{self, Component};
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::{net::SocketAddr, path::PathBuf, time::SystemTime};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
 
@@ -49,7 +50,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::{collections::HashMap, sync::Arc};
 use sysinfo::Disks;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 use toml::Table;
 use tower::ServiceBuilder;
@@ -97,11 +98,39 @@ const LAST_MODIFIED: &str = "last-modified";
 const ETAG: &str = "etag";
 const CONTENT_TYPE: &str = "content-type";
 
-type FileSemaphores = Arc<RwLock<HashMap<String, Arc<Semaphore>>>>;
+/// Per-path upload/download interlock. The map is guarded by a plain mutex
+/// rather than an async one: the critical section is a single HashMap lookup
+/// with no await point in it, so an async lock only added scheduler work to
+/// every request. The `Semaphore` itself stays async — that is the part
+/// requests actually wait on.
+type FileSemaphores = Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>;
 
 #[derive(Clone)]
 struct AppState {
     file_locks: FileSemaphores,
+}
+
+/// Read granularity for streaming a cached file back to the client.
+///
+/// Every chunk costs one blocking-pool dispatch plus one buffer allocation, so
+/// `ReaderStream`'s 4KB default means ~256k of each per GB served — measured at
+/// ~22MB/s for a 1GB local file, against ~500MB/s at 256KB. The buffer is live
+/// only while a response body is being written, so the cost is 256KB per
+/// in-flight download (~25MB at 100 concurrent); dial it down with
+/// KCI_STORAGE_STREAM_CHUNK_KB if concurrency is high enough for that to
+/// matter.
+const STREAM_DEFAULT_CHUNK_KB: usize = 256;
+
+fn stream_chunk_bytes() -> usize {
+    static CHUNK: OnceLock<usize> = OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("KCI_STORAGE_STREAM_CHUNK_KB")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(STREAM_DEFAULT_CHUNK_KB)
+            * 1024
+    })
 }
 
 const ARCHIVE_MAX_FILES: usize = 10_000;
@@ -133,8 +162,8 @@ struct ArchiveResponse {
     failures: Vec<String>,
 }
 
-async fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<Semaphore> {
-    let mut map = locks.write().await;
+fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<Semaphore> {
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
     map.entry(filename.to_string())
         .or_insert_with(|| Arc::new(Semaphore::new(1)))
         .clone()
@@ -142,8 +171,8 @@ async fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<
 
 /// Remove semaphore entries that are no longer in use (strong_count == 1 means
 /// only the map itself holds a reference).
-async fn cleanup_semaphore(locks: &FileSemaphores, filename: &str) {
-    let mut map = locks.write().await;
+fn cleanup_semaphore(locks: &FileSemaphores, filename: &str) {
+    let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(sem) = map.get(filename) {
         if Arc::strong_count(sem) == 1 {
             map.remove(filename);
@@ -172,6 +201,27 @@ struct ReceivedFile {
     headers: HeaderMap,
     valid: bool,
     cache_state: CacheState,
+    /// Open handle to the content file, plus the size taken from that same
+    /// handle. Drivers open the file inside the blocking section that already
+    /// stats it, so the GET handler neither re-stats nor re-opens, and cannot
+    /// race a cache eviction between the two.
+    file: Option<std::fs::File>,
+    size: u64,
+}
+
+impl ReceivedFile {
+    /// A "not found" result for `filename`; drivers fill in the rest on success.
+    fn not_found(filename: String, cache_state: CacheState) -> Self {
+        ReceivedFile {
+            original_filename: filename,
+            cached_filename: String::new(),
+            headers: HeaderMap::new(),
+            valid: false,
+            cache_state,
+            file: None,
+            size: 0,
+        }
+    }
 }
 
 // Wrapper to convert Multipart Field into AsyncRead
@@ -371,25 +421,53 @@ fn log_auth_error(message: &str, client_info: &str) {
     );
 }
 
-pub fn get_config_content() -> String {
-    let args = get_args();
-    let mut cfg_file = PathBuf::from(&args.config_file);
-    if let Ok(cfg_file_env) = std::env::var("KCI_STORAGE_CONFIG") {
-        cfg_file = PathBuf::from(&cfg_file_env);
-    }
+/// Config file contents, read once and cached for the process lifetime.
+///
+/// The request handlers consult the configuration several times per request
+/// (driver type, backend credentials, retention tag, ...). Re-reading the file
+/// each time put a blocking `read_to_string` on the tokio worker threads in the
+/// hot GET path; the file cannot change without a restart anyway, since the
+/// subnet/user-agent/challenge modules already snapshot it at startup.
+pub fn get_config_content() -> &'static str {
+    static CONTENT: OnceLock<String> = OnceLock::new();
+    CONTENT.get_or_init(|| {
+        let args = get_args();
+        let mut cfg_file = PathBuf::from(&args.config_file);
+        if let Ok(cfg_file_env) = std::env::var("KCI_STORAGE_CONFIG") {
+            cfg_file = PathBuf::from(&cfg_file_env);
+        }
 
-    std::fs::read_to_string(&cfg_file).unwrap()
+        std::fs::read_to_string(&cfg_file).unwrap()
+    })
+}
+
+/// Parsed configuration, cached alongside the raw contents so the hot paths
+/// pay neither the read nor the TOML parse.
+pub fn get_config_table() -> &'static Table {
+    static TABLE: OnceLock<Table> = OnceLock::new();
+    TABLE.get_or_init(|| toml::from_str(get_config_content()).unwrap())
 }
 
 /// Get driver type from config.toml, defaults to "azure" for backward compatibility
-fn get_driver_type() -> String {
-    let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(&cfg_content).unwrap();
+fn get_driver_type() -> &'static str {
+    static DRIVER_TYPE: OnceLock<String> = OnceLock::new();
+    DRIVER_TYPE.get_or_init(|| {
+        get_config_table()
+            .get("driver")
+            .and_then(|v| v.as_str())
+            .unwrap_or("azure")
+            .to_string()
+    })
+}
 
-    cfg.get("driver")
-        .and_then(|v| v.as_str())
-        .unwrap_or("azure")
-        .to_string()
+/// The single backend driver instance. Drivers are stateless handles over
+/// process-wide pooled clients, so building one per request only bought a
+/// config read; the shared instance keeps that off the request path.
+fn driver() -> &'static dyn Driver {
+    static DRIVER: OnceLock<Box<dyn Driver>> = OnceLock::new();
+    DRIVER
+        .get_or_init(|| init_driver(get_driver_type()))
+        .as_ref()
 }
 
 /*
@@ -405,9 +483,7 @@ tag_value = "6m"
 /// blob index tags) can match on it to expire objects. Returns None when
 /// the [retention] section or its tag_value is absent, disabling tagging.
 pub fn get_retention_tag() -> Option<(String, String)> {
-    let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(&cfg_content).ok()?;
-    let retention = cfg.get("retention")?;
+    let retention = get_config_table().get("retention")?;
     let value = retention.get("tag_value").and_then(|v| v.as_str())?;
     let key = retention
         .get("tag_key")
@@ -598,12 +674,15 @@ async fn async_main() {
         eprintln!("Invalid download_challenge configuration: {error}");
         std::process::exit(1);
     });
+    // Build the driver up front so an unknown driver name is rejected at
+    // startup rather than on the first request; it is cached from here on.
+    let _ = driver();
     let port: u16 = std::env::var("KCI_STORAGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
     let state = AppState {
-        file_locks: Arc::new(RwLock::new(HashMap::new())),
+        file_locks: Arc::new(StdMutex::new(HashMap::new())),
     };
     debug_log!("Starting server, tls: {:?}", tlscfg);
 
@@ -765,9 +844,7 @@ fn build_storage_key(path: &mut String, filename: &str) -> Result<String, String
 }
 
 fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
-    let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(&cfg_content).unwrap();
-    let users_r = cfg.get("users");
+    let users_r = get_config_table().get("users");
     let users = match users_r {
         Some(users) => users,
         None => {
@@ -1026,7 +1103,7 @@ async fn upload_extracted_archive_entry(
     owner: String,
     entry: ExtractedArchiveEntry,
 ) -> Result<u64, String> {
-    let semaphore = get_or_create_semaphore(&state.file_locks, &entry.storage_path).await;
+    let semaphore = get_or_create_semaphore(&state.file_locks, &entry.storage_path);
     let permit =
         match tokio::time::timeout(tokio::time::Duration::from_secs(30), semaphore.acquire()).await
         {
@@ -1047,8 +1124,7 @@ async fn upload_extracted_archive_entry(
                 entry.storage_path, e
             )
         })?;
-        let driver_name = get_driver_type();
-        let driver = init_driver(&driver_name);
+        let driver = driver();
         let (result, file_size) = driver
             .write_file_streaming(
                 entry.storage_path.clone(),
@@ -1073,7 +1149,7 @@ async fn upload_extracted_archive_entry(
     .await;
 
     drop(permit);
-    cleanup_semaphore(&state.file_locks, &entry.storage_path).await;
+    cleanup_semaphore(&state.file_locks, &entry.storage_path);
     upload_result
 }
 
@@ -1436,7 +1512,7 @@ async fn ax_post_file(
                     }
 
                     let hdr_content_type = headers.get("Content-Type-Upstream");
-                    let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
+                    let semaphore = get_or_create_semaphore(&state.file_locks, &full_path);
                     locked_path = Some(full_path.clone());
 
                     // Try to acquire permit - wait for up to 30 seconds
@@ -1478,8 +1554,7 @@ async fn ax_post_file(
                     // Stream the file upload directly
                     debug_log!("Starting streaming upload for {}", full_path);
                     let mut field_stream = FieldStream::new(field);
-                    let driver_name = get_driver_type();
-                    let driver = init_driver(&driver_name);
+                    let driver = driver();
 
                     let (result, file_size) = driver
                         .write_file_streaming(
@@ -1536,7 +1611,7 @@ async fn ax_post_file(
 
     // Clean up semaphore from the fast path (permit already dropped by leaving the loop)
     if let Some(ref lp) = locked_path {
-        cleanup_semaphore(&state.file_locks, lp).await;
+        cleanup_semaphore(&state.file_locks, lp);
     }
 
     // Handle buffered file0 case (file0 arrived before path)
@@ -1557,7 +1632,7 @@ async fn ax_post_file(
             }
 
             let hdr_content_type = headers.get("Content-Type-Upstream");
-            let semaphore = get_or_create_semaphore(&state.file_locks, &full_path).await;
+            let semaphore = get_or_create_semaphore(&state.file_locks, &full_path);
 
             let _permit = match semaphore.try_acquire() {
                 Ok(permit) => permit,
@@ -1593,8 +1668,7 @@ async fn ax_post_file(
                 }
             };
 
-            let driver_name = get_driver_type();
-            let driver = init_driver(&driver_name);
+            let driver = driver();
 
             let (result, file_size) = driver
                 .write_file_streaming(
@@ -1608,7 +1682,7 @@ async fn ax_post_file(
             // tmp (NamedTempFile) is dropped here, auto-deleting the temp file
 
             drop(_permit);
-            cleanup_semaphore(&state.file_locks, &full_path).await;
+            cleanup_semaphore(&state.file_locks, &full_path);
 
             if result.is_empty() {
                 return (StatusCode::CONFLICT, Vec::new());
@@ -1649,11 +1723,32 @@ async fn ax_post_file(
 
 fn filename_from_fullpath(filepath: &str) -> String {
     let path = path::Path::new(filepath);
-    let filename = path.file_name();
-    match filename {
-        Some(filename) => filename.to_str().unwrap().to_string(),
+    match path.file_name().and_then(|name| name.to_str()) {
+        Some(filename) => filename.to_string(),
         None => filepath.to_string(),
     }
+}
+
+/// Build the Content-Disposition value for a download.
+///
+/// The filename comes from the request path, so it can contain bytes a header
+/// value cannot carry. Control characters are replaced (a path like
+/// "/dir/%0Aname" would otherwise make `HeaderValue` construction fail and
+/// panic the handler), as are the quote and backslash so they cannot terminate
+/// the quoted-string early. Everything else, non-ASCII included, is left alone.
+fn content_disposition_value(filename: &str) -> header::HeaderValue {
+    let safe: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_control() || c == '"' || c == '\\' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    header::HeaderValue::from_str(&format!("attachment; filename=\"{}\"", safe))
+        .unwrap_or_else(|_| header::HeaderValue::from_static("attachment"))
 }
 
 /*
@@ -1686,15 +1781,14 @@ async fn ax_get_file(
     };
 
     let timestamp = std::time::SystemTime::now();
-    let user_agent = rxheaders.get("User-Agent");
-    let user_agent_str = match user_agent {
-        Some(user_agent) => user_agent.to_str().unwrap(),
-        None => "",
-    };
+    let user_agent_str = rxheaders
+        .get("User-Agent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
 
     let client_ip = client_ip_from_headers(&rxheaders, remote_addr);
 
-    let semaphore = get_or_create_semaphore(&state.file_locks, &filepath).await;
+    let semaphore = get_or_create_semaphore(&state.file_locks, &filepath);
     // Wait for permit with timeout
     let _permit =
         match tokio::time::timeout(tokio::time::Duration::from_secs(30), semaphore.acquire()).await
@@ -1713,7 +1807,7 @@ async fn ax_get_file(
 
     // Release the semaphore now that the file is resolved
     drop(_permit);
-    cleanup_semaphore(&state.file_locks, &filepath).await;
+    cleanup_semaphore(&state.file_locks, &filepath);
 
     if !received_file.valid {
         log_access(
@@ -1729,12 +1823,12 @@ async fn ax_get_file(
         );
         return (StatusCode::NOT_FOUND, format!("Not Found: {}", filepath)).into_response();
     }
-    let cached_file = received_file.cached_filename;
     let original_filename = received_file.original_filename;
     let upstream_headers = received_file.headers;
     let cache_state = received_file.cache_state;
-    //let file: tokio::fs::File;
-    let metadata = tokio::fs::metadata(&cached_file).await.unwrap();
+    // The driver opened the file and sized it on a blocking thread; nothing on
+    // this path stats or opens it again.
+    let file_size = received_file.size;
     let mut headers = HeaderMap::new();
     if let Some(rate) = fallback_rate {
         if let Ok(value) = header::HeaderValue::from_str(&rate.to_string()) {
@@ -1752,9 +1846,7 @@ async fn ax_get_file(
     let filename_only = filename_from_fullpath(&original_filename);
     headers.insert(
         header::CONTENT_DISPOSITION,
-        format!("attachment; filename=\"{}\"", filename_only)
-            .parse()
-            .unwrap(),
+        content_disposition_value(&filename_only),
     );
 
     headers.insert(header::ACCEPT_RANGES, "bytes".parse().unwrap());
@@ -1813,7 +1905,7 @@ async fn ax_get_file(
 
     /* Usually HEAD is used to check if the file exists and range is supported */
     if method == axum::http::Method::HEAD {
-        if let Ok(val) = header::HeaderValue::from_str(&metadata.len().to_string()) {
+        if let Ok(val) = header::HeaderValue::from_str(&file_size.to_string()) {
             headers.insert(header::CONTENT_LENGTH, val);
         }
         log_access_with_cache_state(
@@ -1831,84 +1923,9 @@ async fn ax_get_file(
         return (headers, Body::empty()).into_response();
     }
 
-    match tokio::fs::File::open(&cached_file).await {
-        Ok(mut file) => {
-            let mut start = 0;
-            let mut end = metadata.len();
-            // is Content-Range present?
-            if let Some(range) = rxheaders.get("Range") {
-                match range.to_str().ok().and_then(parse_range) {
-                    Some(parsed) => (start, end) = parsed,
-                    None => {
-                        return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header")
-                            .into_response();
-                    }
-                }
-            }
-            // if start is set to non-zero, we need to seek
-            if start != 0 && (end == metadata.len() || end == 0) {
-                file.seek(std::io::SeekFrom::Start(start)).await.unwrap();
-                headers.insert(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-", start).parse().unwrap(),
-                );
-                if end == 0 || end >= metadata.len() {
-                    end = metadata.len();
-                }
-                headers.insert(
-                    header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end - 1, metadata.len())
-                        .parse()
-                        .unwrap(),
-                );
-                headers.insert(
-                    header::CONTENT_LENGTH,
-                    format!("{}", end - start).parse().unwrap(),
-                );
-            } else {
-                headers.insert(
-                    header::CONTENT_LENGTH,
-                    format!("{}", metadata.len()).parse().unwrap(),
-                );
-            }
-            // If end... who cares about end :-D
-            // Well, we need to implement it
-            // TODO: implement "end" limit
-            let stream = ReaderStream::new(file);
-            let axbody = Body::from_stream(stream);
-
-            //println!("Headers: {:?}", headers);
-            if start != 0 {
-                let body_size = end - start;
-                log_access(
-                    timestamp,
-                    &client_ip,
-                    StatusCode::PARTIAL_CONTENT,
-                    body_size,
-                    method.as_str(),
-                    &filepath,
-                    &filepath,
-                    "ua",
-                    user_agent_str,
-                );
-                (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response()
-            } else {
-                log_access_with_cache_state(
-                    timestamp,
-                    &client_ip,
-                    StatusCode::OK,
-                    metadata.len(),
-                    method.as_str(),
-                    &filepath,
-                    &filepath,
-                    "ua",
-                    user_agent_str,
-                    cache_state,
-                );
-                (StatusCode::OK, headers, axbody).into_response()
-            }
-        }
-        Err(_) => {
+    let std_file = match received_file.file {
+        Some(file) => file,
+        None => {
             eprintln!("Error opening file in ax_get_file");
             log_access(
                 timestamp,
@@ -1921,15 +1938,110 @@ async fn ax_get_file(
                 "ua",
                 user_agent_str,
             );
-            (StatusCode::NOT_FOUND, headers, Body::empty()).into_response()
+            return (StatusCode::NOT_FOUND, headers, Body::empty()).into_response();
         }
+    };
+
+    // Range. `parse_range` reports an unspecified/invalid end as 0, which is
+    // how an open-ended "bytes=100-" arrives here; `last` is the inclusive
+    // final byte actually served.
+    let mut start = 0u64;
+    let mut explicit_end = None;
+    if let Some(range) = rxheaders.get("Range") {
+        match range.to_str().ok().and_then(parse_range) {
+            Some((parsed_start, parsed_end)) => {
+                start = parsed_start;
+                explicit_end = (parsed_end != 0).then_some(parsed_end);
+            }
+            None => {
+                return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header")
+                    .into_response();
+            }
+        }
+    }
+    let is_range = start != 0 || explicit_end.is_some();
+    if is_range && start >= file_size {
+        headers.insert(
+            header::CONTENT_RANGE,
+            format!("bytes */{}", file_size).parse().unwrap(),
+        );
+        return (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            headers,
+            "Range not satisfiable",
+        )
+            .into_response();
+    }
+    let last = explicit_end
+        .unwrap_or(file_size.saturating_sub(1))
+        .min(file_size.saturating_sub(1));
+    let body_size = if is_range {
+        last + 1 - start
+    } else {
+        file_size
+    };
+
+    let mut file = tokio::fs::File::from_std(std_file);
+    if start != 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            eprintln!("Error seeking {} to {}: {}", filepath, start, e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Seek failed").into_response();
+        }
+    }
+    if is_range {
+        headers.insert(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, last, file_size)
+                .parse()
+                .unwrap(),
+        );
+    }
+    headers.insert(
+        header::CONTENT_LENGTH,
+        format!("{}", body_size).parse().unwrap(),
+    );
+
+    // Bound the reader to the requested range so a partial request stops at the
+    // end of the range instead of reading to EOF, and read in large blocks:
+    // ReaderStream's 4KB default turns a multi-GB artifact into millions of
+    // blocking read dispatches and buffer allocations.
+    let reader = file.take(body_size);
+    let stream = ReaderStream::with_capacity(reader, stream_chunk_bytes());
+    let axbody = Body::from_stream(stream);
+
+    //println!("Headers: {:?}", headers);
+    if is_range {
+        log_access(
+            timestamp,
+            &client_ip,
+            StatusCode::PARTIAL_CONTENT,
+            body_size,
+            method.as_str(),
+            &filepath,
+            &filepath,
+            "ua",
+            user_agent_str,
+        );
+        (StatusCode::PARTIAL_CONTENT, headers, axbody).into_response()
+    } else {
+        log_access_with_cache_state(
+            timestamp,
+            &client_ip,
+            StatusCode::OK,
+            file_size,
+            method.as_str(),
+            &filepath,
+            &filepath,
+            "ua",
+            user_agent_str,
+            cache_state,
+        );
+        (StatusCode::OK, headers, axbody).into_response()
     }
 }
 
 async fn driver_get_file(filepath: String) -> ReceivedFile {
-    let driver_name = get_driver_type();
-    let driver = init_driver(&driver_name);
-    driver.get_file(filepath).await
+    driver().get_file(filepath).await
 }
 
 #[allow(dead_code)]
@@ -1939,8 +2051,7 @@ async fn write_file_driver(
     cont_type: String,
     owner_email: Option<String>,
 ) -> String {
-    let driver_name = get_driver_type();
-    let driver = init_driver(&driver_name);
+    let driver = driver();
     driver
         .write_file(filename, data, cont_type, owner_email)
         .await;
@@ -2033,7 +2144,7 @@ async fn ax_list_files() -> (StatusCode, String) {
             "Listing files is disabled for Azure storage backend".to_string(),
         );
     }
-    let driver = init_driver(&driver_name);
+    let driver = driver();
     let files = driver.list_files("/".to_string()).await;
     // generate nice list of files, with one file per line
     let files_str = files.join("\n");

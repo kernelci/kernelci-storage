@@ -677,6 +677,148 @@ fn test_range_request() {
 }
 
 #[test]
+fn test_range_request_with_end() {
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let client = server.client();
+
+    let file_content = b"0123456789ABCDEF";
+
+    let form = multipart::Form::new().text("path", "range-end-test").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("data.bin")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
+    let resp = client
+        .post(server.url("/v1/file"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // A bounded range must stop at the requested end, not run to EOF.
+    let resp = client
+        .get(server.url("/range-end-test/data.bin"))
+        .header("Range", "bytes=4-9")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 4-9/16")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some("6")
+    );
+    let body = resp.bytes().unwrap();
+    assert_eq!(body.as_ref(), &file_content[4..=9]);
+
+    // A range starting at 0 is still a range: 206 with just the asked-for bytes.
+    let resp = client
+        .get(server.url("/range-end-test/data.bin"))
+        .header("Range", "bytes=0-3")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().unwrap();
+    assert_eq!(body.as_ref(), &file_content[0..=3]);
+
+    // An end past EOF is clamped to the last byte.
+    let resp = client
+        .get(server.url("/range-end-test/data.bin"))
+        .header("Range", "bytes=10-999")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 206);
+    let body = resp.bytes().unwrap();
+    assert_eq!(body.as_ref(), &file_content[10..]);
+
+    // A start past EOF is unsatisfiable.
+    let resp = client
+        .get(server.url("/range-end-test/data.bin"))
+        .header("Range", "bytes=100-")
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 416);
+    assert_eq!(
+        resp.headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes */16")
+    );
+
+    // No Range header still means a plain 200 with the whole body.
+    let resp = client
+        .get(server.url("/range-end-test/data.bin"))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.bytes().unwrap().as_ref(), file_content);
+}
+
+/// A stored filename that is not visible ASCII must not break the response:
+/// Content-Disposition only accepts visible ASCII, and building it from the
+/// raw name used to panic the handler.
+#[test]
+fn test_non_ascii_filename_download() {
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let client = server.client();
+
+    let file_content = b"non-ascii filename content";
+
+    let form = multipart::Form::new().text("path", "utf8-test").part(
+        "file0",
+        multipart::Part::bytes(file_content.to_vec())
+            .file_name("linux-über.tar.gz")
+            .mime_str("application/octet-stream")
+            .unwrap(),
+    );
+    let resp = client
+        .post(server.url("/v1/file"))
+        .header("Authorization", format!("Bearer {}", token))
+        .multipart(form)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let resp = client
+        .get(server.url("/utf8-test/linux-über.tar.gz"))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200, "non-ASCII filename must not 5xx");
+    let disposition = resp
+        .headers()
+        .get("content-disposition")
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    assert_eq!(
+        disposition.as_deref(),
+        Some("attachment; filename=\"linux-über.tar.gz\""),
+        "non-ASCII filename should survive into Content-Disposition"
+    );
+    assert_eq!(resp.bytes().unwrap().as_ref(), file_content);
+
+    // A control character in the path must be neutralised, not panic the handler.
+    let resp = client
+        .get(server.url("/utf8-test/linux-%0Aevil.tar.gz"))
+        .send()
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "control character in path must be handled, not 5xx"
+    );
+}
+
+#[test]
 fn test_head_request() {
     let server = TestServer::start();
     let token = generate_token(TEST_EMAIL);

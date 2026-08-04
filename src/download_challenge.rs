@@ -133,7 +133,7 @@ fn integer_setting(section: &Table, name: &str) -> Result<Option<u64>, String> {
 }
 
 pub fn init() -> Result<(), String> {
-    let config: Table = toml::from_str(&crate::get_config_content())
+    let config: Table = toml::from_str(crate::get_config_content())
         .map_err(|error| format!("failed to parse config: {error}"))?;
     CONFIG
         .set(parse_config(&config)?)

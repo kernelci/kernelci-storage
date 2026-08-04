@@ -40,7 +40,7 @@ fn parse_blocked_subnets(config: &Table) -> Result<Vec<IpNet>, String> {
 }
 
 pub fn init() -> Result<(), String> {
-    let config: Table = toml::from_str(&crate::get_config_content())
+    let config: Table = toml::from_str(crate::get_config_content())
         .map_err(|error| format!("failed to parse config: {error}"))?;
     let subnets = parse_blocked_subnets(&config)?;
     BLOCKED_SUBNETS
