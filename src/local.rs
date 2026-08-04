@@ -2,7 +2,7 @@
 // Copyright (C) 2024-2025 Collabora, Ltd.
 // Author: Denys Fedoryshchenko <denys.f@collabora.com>
 
-use crate::{debug_log, get_config_content, CacheState, ReceivedFile};
+use crate::{debug_log, CacheState, ReceivedFile};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use chksum_hash_sha2_512 as sha2_512;
@@ -11,8 +11,8 @@ use serde::Deserialize;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::io::AsyncReadExt;
-use toml::Table;
 
 pub struct LocalDriver;
 
@@ -27,31 +27,33 @@ struct LocalConfig {
     storage_path: String,
 }
 
-/// Get local storage configuration from config.toml
-fn get_local_config() -> LocalConfig {
-    let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(&cfg_content).unwrap();
+/// Get local storage configuration from config.toml, parsed once and cached:
+/// every path lookup needs it, and re-parsing the file per request is pure
+/// overhead for a value that cannot change without a restart.
+fn get_local_config() -> &'static LocalConfig {
+    static CONFIG: OnceLock<LocalConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| {
+        // Default to "./storage" if no local config section exists
+        let local_cfg = match crate::get_config_table().get("local") {
+            Some(local_cfg) => local_cfg,
+            None => {
+                debug_log!(
+                    "No local section in config.toml, using default storage path: ./storage"
+                );
+                return LocalConfig {
+                    storage_path: "./storage".to_string(),
+                };
+            }
+        };
 
-    // Default to "./storage" if no local config section exists
-    let default_config = LocalConfig {
-        storage_path: "./storage".to_string(),
-    };
+        let storage_path = local_cfg
+            .get("storage_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("./storage")
+            .to_string();
 
-    let local_cfg = match cfg.get("local") {
-        Some(local_cfg) => local_cfg,
-        None => {
-            debug_log!("No local section in config.toml, using default storage path: ./storage");
-            return default_config;
-        }
-    };
-
-    let storage_path = local_cfg
-        .get("storage_path")
-        .and_then(|v| v.as_str())
-        .unwrap_or("./storage")
-        .to_string();
-
-    LocalConfig { storage_path }
+        LocalConfig { storage_path }
+    })
 }
 
 /// Create directory structure for a file path
@@ -86,21 +88,26 @@ fn get_storage_file_path(filename: &str) -> PathBuf {
     }
 }
 
-/// Get metadata file path for storing headers
+/// Get metadata file path for storing headers. Pure path arithmetic: the read
+/// path calls this per request, so it must not touch the filesystem. Writers
+/// call `ensure_metadata_dir` first.
 fn get_metadata_file_path(filename: &str) -> PathBuf {
     let config = get_local_config();
-    let storage_path = Path::new(&config.storage_path);
-    let metadata_path = storage_path.join(".metadata");
-
-    // Create metadata directory if it doesn't exist
-    if !metadata_path.exists() {
-        let _ = fs::create_dir_all(&metadata_path);
-    }
+    let metadata_path = Path::new(&config.storage_path).join(".metadata");
 
     // Generate hash-based filename for metadata
     let hash = sha2_512::default().update(filename.as_bytes()).finalize();
     let digest = hash.digest();
     metadata_path.join(format!("{}.headers", digest.to_hex_lowercase()))
+}
+
+/// Create the metadata directory if it is missing. Only needed before writing.
+fn ensure_metadata_dir() {
+    let config = get_local_config();
+    let metadata_path = Path::new(&config.storage_path).join(".metadata");
+    if !metadata_path.exists() {
+        let _ = fs::create_dir_all(&metadata_path);
+    }
 }
 
 /// Calculate SHA-512 checksum of file data
@@ -162,6 +169,7 @@ async fn write_file_to_local_streaming(
     }
 
     // Create and write metadata (headers, owner and retention tags)
+    ensure_metadata_dir();
     let metadata_path = get_metadata_file_path(&filename);
     if let Ok(mut metadata_file) = File::create(&metadata_path) {
         let metadata_content = build_metadata_content(&cont_type, owner_email);
@@ -201,6 +209,7 @@ fn write_file_to_local(
     }
 
     // Create and write metadata (headers, owner and retention tags)
+    ensure_metadata_dir();
     let metadata_path = get_metadata_file_path(&filename);
     if let Ok(mut metadata_file) = File::create(&metadata_path) {
         let metadata_content = build_metadata_content(&cont_type, owner_email);
@@ -237,28 +246,45 @@ fn get_headers_from_metadata_file(filename: &str) -> HeaderMap {
     headers
 }
 
-/// Get file from local storage
+/// Get file from local storage.
+///
+/// Runs on a blocking thread, so it opens the file here and hands the caller a
+/// ready handle plus its size: that replaces the exists-check with the open
+/// itself (one syscall instead of two) and saves the GET handler a separate
+/// stat and open on the async worker threads.
 fn get_file_from_local(filename: String) -> ReceivedFile {
     let file_path = get_storage_file_path(&filename);
 
-    let mut received_file = ReceivedFile {
-        original_filename: filename.clone(),
-        cached_filename: String::new(),
-        headers: HeaderMap::new(),
-        valid: false,
-        cache_state: CacheState::Cached,
-    };
+    let mut received_file = ReceivedFile::not_found(filename.clone(), CacheState::Cached);
 
-    // Check if file exists
-    if !file_path.exists() {
-        debug_log!("File not found in local storage: {}", file_path.display());
-        return received_file;
-    }
+    let file = match File::open(&file_path) {
+        Ok(file) => file,
+        Err(_) => {
+            debug_log!("File not found in local storage: {}", file_path.display());
+            return received_file;
+        }
+    };
+    let size = match file.metadata() {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => {
+            debug_log!(
+                "Not a regular file in local storage: {}",
+                file_path.display()
+            );
+            return received_file;
+        }
+        Err(e) => {
+            eprintln!("Error reading metadata of {}: {}", file_path.display(), e);
+            return received_file;
+        }
+    };
 
     // For local storage, we use the same file as both original and cached
     received_file.cached_filename = file_path.to_string_lossy().to_string();
     received_file.headers = get_headers_from_metadata_file(&filename);
     received_file.valid = true;
+    received_file.file = Some(file);
+    received_file.size = size;
 
     debug_log!("File found in local storage: {}", file_path.display());
     received_file
@@ -316,6 +342,7 @@ fn set_tags_for_local_file(
     filename: String,
     user_tags: Vec<(String, String)>,
 ) -> Result<String, String> {
+    ensure_metadata_dir();
     let metadata_path = get_metadata_file_path(&filename);
 
     // Read existing metadata
@@ -399,13 +426,7 @@ impl super::Driver for LocalDriver {
             .await
             .unwrap_or_else(|e| {
                 eprintln!("Local storage get_file task panicked: {}", e);
-                ReceivedFile {
-                    original_filename: String::new(),
-                    cached_filename: String::new(),
-                    headers: HeaderMap::new(),
-                    valid: false,
-                    cache_state: CacheState::Cached,
-                }
+                ReceivedFile::not_found(String::new(), CacheState::Cached)
             })
     }
 

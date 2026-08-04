@@ -101,7 +101,7 @@ static BANNED_USER_AGENTS: OnceLock<Vec<String>> = OnceLock::new();
 /// for case-insensitive matching.
 fn banned_user_agents() -> &'static Vec<String> {
     BANNED_USER_AGENTS.get_or_init(|| {
-        let cfg: Option<Table> = toml::from_str(&crate::get_config_content()).ok();
+        let cfg: Option<Table> = toml::from_str(crate::get_config_content()).ok();
         let section = cfg.as_ref().and_then(|cfg| cfg.get("useragent"));
 
         let use_defaults = section

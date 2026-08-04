@@ -153,7 +153,7 @@ fn default_cleanup_chunk_size() -> usize {
 
 fn get_cache_config() -> CacheConfig {
     let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(&cfg_content).unwrap_or_else(|_| Table::new());
+    let cfg: Table = toml::from_str(cfg_content).unwrap_or_else(|_| Table::new());
     let cleanup_chunk_size = cfg
         .get("cache")
         .and_then(|section| section.get("cleanup_chunk_size"))

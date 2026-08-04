@@ -10,7 +10,7 @@ impl AzureDriver {
     }
 }
 
-use crate::{debug_log, get_config_content, CacheState, ReceivedFile};
+use crate::{debug_log, CacheState, ReceivedFile};
 use async_trait::async_trait;
 use axum::http::{HeaderName, HeaderValue};
 use azure_storage::StorageCredentials;
@@ -30,7 +30,6 @@ use std::io::Write;
 use std::sync::OnceLock;
 use tempfile::Builder;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use toml::Table;
 
 #[derive(Deserialize)]
 struct AzureConfig {
@@ -67,11 +66,17 @@ fn normalize_sas_token(input: &str) -> String {
     }
 }
 
+/// Azure credentials from config.toml, parsed once and cached. The GET path
+/// needs the SAS token on every request; re-reading and re-parsing the config
+/// file there was blocking disk I/O on the async worker threads.
+fn azure_credentials() -> &'static AzureConfig {
+    static CONFIG: OnceLock<AzureConfig> = OnceLock::new();
+    CONFIG.get_or_init(|| get_azure_credentials("azure"))
+}
+
 /// Get Azure credentials from config.toml
 fn get_azure_credentials(name: &str) -> AzureConfig {
-    let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(&cfg_content).unwrap();
-    let azure_cfg = cfg.get(name).unwrap();
+    let azure_cfg = crate::get_config_table().get(name).unwrap();
     let account = azure_cfg.get("account").unwrap().as_str().unwrap();
     let key = azure_cfg.get("key").unwrap().as_str().unwrap();
     let container = azure_cfg.get("container").unwrap().as_str().unwrap();
@@ -92,7 +97,7 @@ fn get_azure_credentials(name: &str) -> AzureConfig {
 fn azure_container_client() -> &'static ContainerClient {
     static CLIENT: OnceLock<ContainerClient> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        let cfg = get_azure_credentials("azure");
+        let cfg = azure_credentials();
         let credential = StorageCredentials::access_key(cfg.account.as_str(), cfg.key.clone());
         ClientBuilder::new(cfg.account.clone(), credential).container_client(cfg.container.clone())
     })
@@ -428,31 +433,45 @@ async fn write_file_to_blob(
     "OK"
 }
 
-/// Get headers from file (Maybe should be moved to a separate module, its not Azure specific)
-fn get_headers_from_file(filename: String) -> HeaderMap {
+/// Read a cached headers sidecar. Returns None when the file is not there yet
+/// (another request is still downloading) or cannot be read. Malformed lines
+/// are skipped rather than panicking a request handler.
+/// (Maybe should be moved to a separate module, its not Azure specific)
+fn read_headers_file(path: &str) -> Option<HeaderMap> {
+    let file_content = read_to_string(path).ok()?;
     let mut headers = HeaderMap::new();
-    let file_content = read_to_string(filename).unwrap();
     for line in file_content.lines() {
         // Split only on the first ':' so values like times (HH:MM:SS) are preserved
         if let Some((name, value)) = line.split_once(':') {
-            let key = HeaderName::from_bytes(name.trim().as_bytes()).unwrap();
-            let value = HeaderValue::from_str(value.trim()).unwrap();
-            headers.insert(key, value);
+            if let (Ok(key), Ok(value)) = (
+                HeaderName::from_bytes(name.trim().as_bytes()),
+                HeaderValue::from_str(value.trim()),
+            ) {
+                headers.insert(key, value);
+            }
         }
     }
-    headers
+    Some(headers)
 }
 
-/// Save headers(Azure) to file
-fn save_headers_to_file(filename: String, headers: HeaderMap) {
-    let f = File::create(&filename);
-    match f {
+/// Save headers(Azure) to file. Blocking — call it from a blocking thread.
+/// Built in one buffer so the sidecar lands in a single write.
+fn save_headers_to_file(filename: &str, headers: &HeaderMap) {
+    let mut body = String::new();
+    for (key, value) in headers.iter() {
+        // TBD: Filter out some names?
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        body.push_str(&key.as_str().to_lowercase());
+        body.push(':');
+        body.push_str(value);
+        body.push('\n');
+    }
+    match File::create(filename) {
         Ok(mut f) => {
-            for (key, value) in headers.iter() {
-                let key_lower = key.as_str().to_lowercase();
-                let line = format!("{}:{}\n", key_lower, value.to_str().unwrap());
-                // TBD: Filter out some names?
-                f.write_all(line.as_bytes()).unwrap();
+            if let Err(e) = f.write_all(body.as_bytes()) {
+                eprintln!("Error writing headers file {}: {:?}", filename, e);
             }
         }
         Err(e) => {
@@ -461,21 +480,80 @@ fn save_headers_to_file(filename: String, headers: HeaderMap) {
     }
 }
 
+/// Outcome of inspecting the on-disk cache entry for a blob.
+enum CacheProbe {
+    /// Content and headers are both present; the content file is already open.
+    Hit {
+        file: File,
+        size: u64,
+        headers: HeaderMap,
+    },
+    /// Content is present and non-empty but the headers sidecar has not been
+    /// published yet, i.e. another request is still downloading this blob.
+    HeadersPending,
+    /// Nothing usable cached; fetch from the backend.
+    Miss,
+    /// A broken entry that could not be cleaned up; fail the request.
+    Broken,
+}
+
+/// Inspect (and, when stale, clean up) the cache entry for a blob.
+///
+/// Blocking — call it from a blocking thread. Everything the GET handler needs
+/// is collected here in one hop: the open content handle, its size taken from
+/// that same handle, and the parsed headers. Opening rather than stat-then-open
+/// also closes the window where cache eviction removes the file in between.
+fn probe_cache(content_path: &str, headers_path: &str) -> CacheProbe {
+    let file = match File::open(content_path) {
+        Ok(file) => file,
+        Err(_) => return CacheProbe::Miss,
+    };
+
+    let size = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(e) => {
+            eprintln!("Error reading metadata of {}: {:?}", content_path, e);
+            return CacheProbe::Miss;
+        }
+    };
+
+    if size == 0 {
+        drop(file);
+        debug_log!("Cache file {} is zero length, deleting", content_path);
+        if let Err(e) = std::fs::remove_file(content_path) {
+            eprintln!("Error deleting cached file {}: {:?}", content_path, e);
+            return CacheProbe::Broken;
+        }
+        match std::fs::remove_file(headers_path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("Error deleting cached file {}: {:?}", headers_path, e);
+                return CacheProbe::Broken;
+            }
+        }
+        return CacheProbe::Miss;
+    }
+
+    // Headers are written only after the content file is published, so their
+    // absence means the download is still in flight.
+    match read_headers_file(headers_path) {
+        Some(headers) => CacheProbe::Hit {
+            file,
+            size,
+            headers,
+        },
+        None => CacheProbe::HeadersPending,
+    }
+}
+
 /// Get file from Azure blob storage
 async fn get_file_from_blob(filename: String) -> ReceivedFile {
-    let azure_cfg = get_azure_credentials("azure");
     //println!("get_file_from_blob {}", filename);
-    let storage_sastoken = azure_cfg.sastoken.as_str();
+    let storage_sastoken = azure_credentials().sastoken.as_str();
     let blob_client = azure_blob_client(filename.as_str());
     let blob_url_res = blob_client.url();
-    let mut received_file = ReceivedFile {
-        original_filename: "".to_string(),
-        cached_filename: "".to_string(),
-        headers: HeaderMap::new(),
-        valid: false,
-        cache_state: CacheState::Uncached,
-    };
-    received_file.original_filename = filename.clone();
+    let mut received_file = ReceivedFile::not_found(filename.clone(), CacheState::Uncached);
 
     let mut blob_url = match blob_url_res {
         Ok(url) => url.to_string(),
@@ -494,62 +572,49 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     let (content_path, headers_path) = crate::storcaching::cache_file_paths("cache", &cache_hex);
     let cache_filename = content_path.to_string_lossy().into_owned();
     let cache_filename_headers = headers_path.to_string_lossy().into_owned();
-    // check if cache file exists
-    if std::path::Path::new(&cache_filename).exists() {
-        // check if headers file exists, and if not wait up to 300 seconds
-        // This is to avoid race condition, when we start to download file, but it is not yet completed
-        // and second request to same file downloads incomplete file
-        let mut headers_file_exists = false;
-        for seconds in 0..300 {
-            if std::path::Path::new(&cache_filename_headers).exists() {
-                headers_file_exists = true;
-                break;
+    // Look for a usable cache entry. The headers sidecar is published after the
+    // content file, so a content file without headers means another request is
+    // mid-download; wait up to 300 seconds for it rather than downloading an
+    // incomplete file a second time.
+    for seconds in 0..=300 {
+        let content = cache_filename.clone();
+        let headers = cache_filename_headers.clone();
+        let probe = match tokio::task::spawn_blocking(move || probe_cache(&content, &headers)).await
+        {
+            Ok(probe) => probe,
+            Err(e) => {
+                eprintln!("Cache probe task panicked: {}", e);
+                return received_file;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-            debug_log!(
-                "Waiting for headers file {} to exist: {} seconds",
-                cache_filename_headers,
-                seconds
-            );
-        }
+        };
 
-        if !headers_file_exists {
-            eprintln!("Headers file {} does not exist", cache_filename_headers);
-            return received_file;
-        }
-        //println!("Cache file {} exists", cache_filename);
-        // is cached file non-zero length?
-        // is cached file non-zero length?
-        let metadata = std::fs::metadata(&cache_filename).unwrap();
-        if metadata.len() > 0 {
-            //println!("Cache file {} is non-zero length", cache_filename);
-            received_file.cached_filename = cache_filename;
-            received_file.headers = get_headers_from_file(cache_filename_headers);
-            received_file.valid = true;
-            received_file.cache_state = CacheState::Cached;
-            return received_file;
-        } else {
-            // delete cache file and headers
-            debug_log!("Cache file {} is zero length, deleting", cache_filename);
-            match std::fs::remove_file(&cache_filename) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "Error deleting cached file {}: {:?}",
-                        cache_filename_headers, e
-                    );
-                    return received_file;
-                }
+        match probe {
+            CacheProbe::Hit {
+                file,
+                size,
+                headers,
+            } => {
+                received_file.cached_filename = cache_filename;
+                received_file.headers = headers;
+                received_file.valid = true;
+                received_file.cache_state = CacheState::Cached;
+                received_file.file = Some(file);
+                received_file.size = size;
+                return received_file;
             }
-            match std::fs::remove_file(&cache_filename_headers) {
-                Ok(_) => {}
-                Err(e) => {
-                    eprintln!(
-                        "Error deleting cached file {}: {:?}",
-                        cache_filename_headers, e
-                    );
+            CacheProbe::Broken => return received_file,
+            CacheProbe::Miss => break,
+            CacheProbe::HeadersPending => {
+                if seconds == 300 {
+                    eprintln!("Headers file {} does not exist", cache_filename_headers);
                     return received_file;
                 }
+                debug_log!(
+                    "Waiting for headers file {} to exist: {} seconds",
+                    cache_filename_headers,
+                    seconds
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
             }
         }
     }
@@ -663,10 +728,32 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
                 return received_file;
             }
 
-            // write headers
-            save_headers_to_file(cache_filename_headers, resp_headers);
-            received_file.cached_filename = cache_filename;
-            received_file.valid = true;
+            // Publish the headers sidecar and open the freshly cached content
+            // for the response in a single blocking hop.
+            let content = cache_filename.clone();
+            let headers_path = cache_filename_headers.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                save_headers_to_file(&headers_path, &resp_headers);
+                let file = File::open(&content).ok()?;
+                let size = file.metadata().ok()?.len();
+                Some((file, size))
+            })
+            .await;
+
+            match opened {
+                Ok(Some((file, size))) => {
+                    received_file.cached_filename = cache_filename;
+                    received_file.valid = true;
+                    received_file.file = Some(file);
+                    received_file.size = size;
+                }
+                Ok(None) => {
+                    eprintln!("Error opening freshly cached file {}", cache_filename);
+                }
+                Err(e) => {
+                    eprintln!("Cache publish task panicked: {}", e);
+                }
+            }
         }
         Err(e) => {
             eprintln!("Error getting blob: {:?}", e);
