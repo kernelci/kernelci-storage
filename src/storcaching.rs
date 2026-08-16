@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
 use toml::Table;
@@ -13,6 +14,36 @@ const DEFAULT_CLEANUP_CHUNK: usize = 100_000;
 const DISK_SPACE_LOW_PERCENT: u64 = 12;
 const DISK_SPACE_RECOVER_PERCENT: u64 = 13;
 const HOUSEKEEPING_INTERVAL_SECS: u64 = 300;
+
+/// Housekeeping passes between two full recounts of the cache. At the default
+/// 300s interval this recounts once an hour.
+const CACHE_RECOUNT_EVERY_PASSES: u32 = 12;
+
+/// Number of `.content` entries currently in the cache.
+///
+/// Kept up to date incrementally by the download path and by the deletion
+/// helpers below, so the housekeeping loop can check the cache size without
+/// touching the filesystem. It is only an estimate between recounts:
+/// concurrent downloads of the same object, or files removed behind our back,
+/// make it drift, and `recount_cache_files` resets it periodically.
+static CACHED_FILES: AtomicUsize = AtomicUsize::new(0);
+
+/// Record that a new `.content` entry was published into the cache.
+pub fn note_cache_file_added() {
+    CACHED_FILES.fetch_add(1, AtomicOrdering::Relaxed);
+}
+
+/// Record that a `.content` entry was removed from the cache.
+pub fn note_cache_file_removed() {
+    let _ = CACHED_FILES.fetch_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |count| {
+        Some(count.saturating_sub(1))
+    });
+}
+
+/// Current number of cached objects, for the housekeeping limits and metrics.
+pub fn cached_file_count() -> usize {
+    CACHED_FILES.load(AtomicOrdering::Relaxed)
+}
 
 /// Length of the hex prefix used as the shard subdirectory name. One level of
 /// 256 buckets keeps each shard small even at the MAX_CACHE_FILES cap
@@ -39,16 +70,21 @@ pub fn ensure_shard_dir(cache_dir: &str, hex: &str) -> std::io::Result<()> {
     fs::create_dir_all(Path::new(cache_dir).join(shard_name(hex)))
 }
 
-/// Collect every file path in the cache: shard subdirectories (one level deep)
+/// Visit every file path in the cache: shard subdirectories (one level deep)
 /// plus any legacy files still sitting directly in the cache root. This keeps
 /// the maintenance tasks working during and after migration.
-fn collect_cache_files(cache_dir: &str) -> Vec<PathBuf> {
-    let mut files = Vec::new();
+///
+/// This is a `read_dir` walk only; it never calls `metadata()`, so it costs one
+/// directory read per shard rather than one inode read per cache entry. Callers
+/// that need file metadata pay for it themselves, on the entries they care
+/// about. Paths are handed to the callback instead of being collected, so a
+/// full walk does not have to materialise a vector of ~1M paths.
+fn visit_cache_files<F: FnMut(PathBuf)>(cache_dir: &str, mut visit: F) {
     let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(e) => {
             eprintln!("Error reading cache directory ({}): {}", cache_dir, e);
-            return files;
+            return;
         }
     };
 
@@ -61,15 +97,33 @@ fn collect_cache_files(cache_dir: &str) -> Vec<PathBuf> {
             // Descend one level into shard subdirectories.
             if let Ok(sub_entries) = fs::read_dir(entry.path()) {
                 for sub_entry in sub_entries.flatten() {
-                    files.push(sub_entry.path());
+                    visit(sub_entry.path());
                 }
             }
         } else {
-            files.push(entry.path());
+            visit(entry.path());
         }
     }
+}
 
-    files
+/// Is this a cache content entry (as opposed to a `.headers` sidecar or a
+/// `.part` file belonging to an in-flight download)?
+fn is_content_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "content")
+}
+
+/// Count the cache entries with a `read_dir`-only walk and reset the counter to
+/// the result. Cheap enough to run periodically; the per-entry `metadata()`
+/// walk in `scan_cache_directory` is not.
+fn recount_cache_files(cache_dir: &str) -> usize {
+    let mut total = 0;
+    visit_cache_files(cache_dir, |path| {
+        if is_content_file(&path) {
+            total += 1;
+        }
+    });
+    CACHED_FILES.store(total, AtomicOrdering::Relaxed);
+    total
 }
 
 /// Migrate a legacy flat cache layout (`cache/<hash>.content`) into the
@@ -209,6 +263,12 @@ struct CleanOutcome {
     reclaimed_bytes: u64,
 }
 
+/// Walk the cache and pick the `chunk_size` least recently modified entries.
+///
+/// This calls `metadata()` once per cache entry, which on a large cache means
+/// hundreds of thousands of inode reads and minutes of disk time when they are
+/// not in the page cache. It must only be called when eviction is actually
+/// about to happen, and only from a blocking context.
 fn scan_cache_directory(cache_dir: &str, chunk_size: usize) -> CacheScanResult {
     let mut result = CacheScanResult::default();
 
@@ -218,33 +278,32 @@ fn scan_cache_directory(cache_dir: &str, chunk_size: usize) -> CacheScanResult {
         None
     };
 
-    for path in collect_cache_files(cache_dir) {
+    visit_cache_files(cache_dir, |path| {
+        if !is_content_file(&path) {
+            return;
+        }
         let file = match path.to_str() {
             Some(path_str) => path_str.to_string(),
-            None => continue,
+            None => return,
         };
-
-        if !file.ends_with(".content") {
-            continue;
-        }
 
         result.total_files += 1;
 
         if let Some(heap) = heap.as_mut() {
             let metadata = match fs::metadata(&path) {
                 Ok(metadata) => metadata,
-                Err(_) => continue,
+                Err(_) => return,
             };
             let last_update = match metadata.modified() {
                 Ok(last_update) => last_update,
-                Err(_) => continue,
+                Err(_) => return,
             };
             heap.push(CacheFile { file, last_update });
             if heap.len() > chunk_size {
                 heap.pop();
             }
         }
-    }
+    });
 
     if let Some(heap) = heap {
         let mut oldest_files = heap.into_sorted_vec();
@@ -252,10 +311,14 @@ fn scan_cache_directory(cache_dir: &str, chunk_size: usize) -> CacheScanResult {
         result.oldest_files = oldest_files;
     }
 
+    // The walk just produced an exact count, so take the opportunity to drop
+    // any drift the incremental counter accumulated.
+    CACHED_FILES.store(result.total_files, AtomicOrdering::Relaxed);
+
     result
 }
 
-async fn freediskspace_percent(cache_dir: &str) -> u64 {
+fn freediskspace_percent(cache_dir: &str) -> u64 {
     let total_r = fs2::total_space(cache_dir);
     let free_r = fs2::available_space(cache_dir);
     let total = match total_r {
@@ -297,6 +360,7 @@ fn delete_cache_file(file: &str) -> CleanOutcome {
         Ok(_) => {
             outcome.deleted_entries = 1;
             outcome.reclaimed_bytes += content_size;
+            note_cache_file_removed();
         }
         Err(_) => {
             debug_log!("Error deleting file: {}", content_filename);
@@ -332,7 +396,7 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-async fn enforce_cache_file_limit(cache_dir: &str, chunk_size: usize) -> (CleanOutcome, usize) {
+fn enforce_cache_file_limit(cache_dir: &str, chunk_size: usize) -> (CleanOutcome, usize) {
     let mut outcome = CleanOutcome::default();
 
     loop {
@@ -371,7 +435,7 @@ struct DiskCleanupResult {
     final_free_space: u64,
 }
 
-async fn enforce_disk_space(
+fn enforce_disk_space(
     cache_dir: &str,
     chunk_size: usize,
     mut free_space: u64,
@@ -403,7 +467,7 @@ async fn enforce_disk_space(
             break;
         }
 
-        free_space = freediskspace_percent(cache_dir).await;
+        free_space = freediskspace_percent(cache_dir);
         if free_space >= DISK_SPACE_RECOVER_PERCENT {
             break;
         }
@@ -438,36 +502,92 @@ fn log_housekeeping(
     }
 }
 
+/// Run a blocking cache maintenance step off the async runtime.
+///
+/// Everything in this module is synchronous filesystem work. Running it
+/// directly in the housekeeping task would block a tokio worker thread for as
+/// long as the walk takes, which on a large cache is minutes.
+async fn blocking<T, F>(what: &str, work: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    match tokio::task::spawn_blocking(work).await {
+        Ok(result) => Some(result),
+        Err(e) => {
+            eprintln!("Cache housekeeping task ({}) failed: {}", what, e);
+            None
+        }
+    }
+}
+
 /// Cache housekeeping loop
 /// Enforces cache size limits and disk space thresholds with periodic logging
+///
+/// The per-tick work is deliberately cheap: a `statvfs` for the free space plus
+/// an in-memory counter for the cache size. The expensive walks only run when a
+/// limit is actually crossed, or once an hour to re-anchor the counter.
 pub async fn cache_loop(cache_dir: &str) {
     let config = get_cache_config();
     let cleanup_chunk_size = config.cleanup_chunk_size.max(1);
     let mut deleted_entries_counter: u64 = 0;
     let mut reclaimed_bytes_counter: u64 = 0;
     let mut next_log = Instant::now();
+    // Force a recount on the first pass, before any limit is evaluated.
+    let mut passes_since_recount = CACHE_RECOUNT_EVERY_PASSES;
 
     loop {
-        let (limit_outcome, file_count) =
-            enforce_cache_file_limit(cache_dir, cleanup_chunk_size).await;
-        deleted_entries_counter += limit_outcome.deleted_entries;
-        reclaimed_bytes_counter += limit_outcome.reclaimed_bytes;
-        let mut cached_file_count = file_count;
+        if passes_since_recount >= CACHE_RECOUNT_EVERY_PASSES {
+            let dir = cache_dir.to_string();
+            if blocking("recount", move || recount_cache_files(&dir))
+                .await
+                .is_some()
+            {
+                passes_since_recount = 0;
+            }
+        } else {
+            passes_since_recount += 1;
+        }
 
-        let mut free_space = freediskspace_percent(cache_dir).await;
+        if cached_file_count() > MAX_CACHE_FILES {
+            let dir = cache_dir.to_string();
+            if let Some((limit_outcome, total_files)) = blocking("file limit", move || {
+                enforce_cache_file_limit(&dir, cleanup_chunk_size)
+            })
+            .await
+            {
+                println!(
+                    "Cache file limit exceeded ({} entries), evicted {} entries.",
+                    total_files, limit_outcome.deleted_entries
+                );
+                deleted_entries_counter += limit_outcome.deleted_entries;
+                reclaimed_bytes_counter += limit_outcome.reclaimed_bytes;
+            }
+        }
+
+        // Read after the file-limit pass, so eviction there is reflected here.
+        let dir = cache_dir.to_string();
+        let mut free_space = blocking("free space", move || freediskspace_percent(&dir))
+            .await
+            .unwrap_or(0);
+
         if free_space < DISK_SPACE_LOW_PERCENT {
             println!(
                 "Free disk is LOW: {}%, starting cache eviction.",
                 free_space
             );
-            let disk_result = enforce_disk_space(cache_dir, cleanup_chunk_size, free_space).await;
-            deleted_entries_counter += disk_result.outcome.deleted_entries;
-            reclaimed_bytes_counter += disk_result.outcome.reclaimed_bytes;
-            cached_file_count =
-                cached_file_count.saturating_sub(disk_result.outcome.deleted_entries as usize);
-            free_space = disk_result.final_free_space;
-            if free_space >= DISK_SPACE_RECOVER_PERCENT {
-                println!("Free disk space is OK: {}%, stopping eviction.", free_space);
+            let dir = cache_dir.to_string();
+            if let Some(disk_result) = blocking("disk space", move || {
+                enforce_disk_space(&dir, cleanup_chunk_size, free_space)
+            })
+            .await
+            {
+                deleted_entries_counter += disk_result.outcome.deleted_entries;
+                reclaimed_bytes_counter += disk_result.outcome.reclaimed_bytes;
+                free_space = disk_result.final_free_space;
+                if free_space >= DISK_SPACE_RECOVER_PERCENT {
+                    println!("Free disk space is OK: {}%, stopping eviction.", free_space);
+                }
             }
         } else {
             debug_log!("Free disk space: {}%", free_space);
@@ -476,7 +596,7 @@ pub async fn cache_loop(cache_dir: &str) {
         if Instant::now() >= next_log {
             log_housekeeping(
                 free_space,
-                cached_file_count,
+                cached_file_count(),
                 deleted_entries_counter,
                 reclaimed_bytes_counter,
             );
@@ -492,22 +612,25 @@ pub async fn cache_loop(cache_dir: &str) {
 fn remove_zero_sized_files(cache_dir: &str) -> u64 {
     let mut removed = 0;
 
-    for path in collect_cache_files(cache_dir) {
+    visit_cache_files(cache_dir, |path| {
         let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
-            Err(_) => continue,
+            Err(_) => return,
         };
 
         if !metadata.is_file() || metadata.len() != 0 {
-            continue;
+            return;
         }
 
         if let Err(e) = fs::remove_file(&path) {
             debug_log!("Failed to remove zero-sized file {:?}: {}", path, e);
         } else {
             removed += 1;
+            if is_content_file(&path) {
+                note_cache_file_removed();
+            }
         }
-    }
+    });
 
     removed
 }
@@ -516,10 +639,10 @@ fn remove_orphan_files(cache_dir: &str) -> u64 {
     let mut contents = HashSet::new();
     let mut headers = HashSet::new();
 
-    for path in collect_cache_files(cache_dir) {
+    visit_cache_files(cache_dir, |path| {
         let path = match path.to_str() {
             Some(path) => path.to_string(),
-            None => continue,
+            None => return,
         };
 
         if let Some(base) = path.strip_suffix(".content") {
@@ -527,7 +650,7 @@ fn remove_orphan_files(cache_dir: &str) -> u64 {
         } else if let Some(base) = path.strip_suffix(".headers") {
             headers.insert(base.to_string());
         }
-    }
+    });
 
     let mut removed = 0;
 
@@ -537,6 +660,7 @@ fn remove_orphan_files(cache_dir: &str) -> u64 {
             debug_log!("Failed to remove orphan content {}: {}", file, e);
         } else {
             removed += 1;
+            note_cache_file_removed();
         }
     }
 
@@ -565,5 +689,66 @@ fn run_cache_validation(cache_dir: String) {
 pub async fn validate_cache(cache_dir: String) {
     if let Err(e) = tokio::task::spawn_blocking(move || run_cache_validation(cache_dir)).await {
         eprintln!("Cache validation task failed: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, b"x").unwrap();
+    }
+
+    /// The whole module shares one process-wide counter, so this stays a single
+    /// test rather than several that would race each other.
+    #[test]
+    fn cache_file_counter_tracks_the_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cache_dir = root.to_str().unwrap();
+
+        // Sharded entries, a legacy entry still in the cache root, plus the
+        // sidecars and in-flight downloads that must not be counted.
+        touch(&root.join("ab/abcd.content"));
+        touch(&root.join("ab/abcd.headers"));
+        touch(&root.join("cd/cdef.content"));
+        touch(&root.join("cd/cdef.headers"));
+        touch(&root.join("legacy.content"));
+        touch(&root.join("legacy.headers"));
+        touch(&root.join("ef/efgh.content.1234.part"));
+
+        assert_eq!(recount_cache_files(cache_dir), 3);
+        assert_eq!(cached_file_count(), 3);
+
+        // The download path keeps the counter current without a walk.
+        note_cache_file_added();
+        assert_eq!(cached_file_count(), 4);
+
+        // Deleting an entry removes both files and decrements once.
+        let evicted = root.join("ab/abcd.content");
+        let outcome = delete_cache_file(evicted.to_str().unwrap());
+        assert_eq!(outcome.deleted_entries, 1);
+        assert!(!evicted.exists());
+        assert!(!root.join("ab/abcd.headers").exists());
+        assert_eq!(cached_file_count(), 3);
+
+        // A recount re-anchors the counter after the drift introduced above.
+        assert_eq!(recount_cache_files(cache_dir), 2);
+
+        // The counter never wraps below zero, however far it drifts.
+        for _ in 0..5 {
+            note_cache_file_removed();
+        }
+        assert_eq!(cached_file_count(), 0);
+
+        // The expensive walk agrees with the cheap one, and re-anchors too.
+        let scan = scan_cache_directory(cache_dir, 10);
+        assert_eq!(scan.total_files, 2);
+        assert_eq!(scan.oldest_files.len(), 2);
+        assert_eq!(cached_file_count(), 2);
     }
 }

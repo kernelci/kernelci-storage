@@ -524,6 +524,7 @@ fn probe_cache(content_path: &str, headers_path: &str) -> CacheProbe {
             eprintln!("Error deleting cached file {}: {:?}", content_path, e);
             return CacheProbe::Broken;
         }
+        crate::storcaching::note_cache_file_removed();
         match std::fs::remove_file(headers_path) {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -727,6 +728,10 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
                 let _ = tokio::fs::remove_file(&cache_temp_filename).await;
                 return received_file;
             }
+            // Keep the housekeeping counter current so it does not have to walk
+            // the cache to learn its size. Two racing downloads of the same
+            // object both count here; the periodic recount corrects that.
+            crate::storcaching::note_cache_file_added();
 
             // Publish the headers sidecar and open the freshly cached content
             // for the response in a single blocking hop.

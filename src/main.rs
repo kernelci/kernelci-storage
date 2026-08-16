@@ -621,7 +621,15 @@ async fn ax_metrics() -> (StatusCode, String) {
     metrics.push_str("# TYPE storage_free_space gauge\n");
     metrics.push_str("# HELP storage_total_space Total space on the disk\n");
     metrics.push_str("# TYPE storage_total_space gauge\n");
+    metrics.push_str("# HELP storage_files_cached Objects currently in the local cache\n");
+    metrics.push_str("# TYPE storage_files_cached gauge\n");
     let hostname = "kernelci-storage".to_string();
+
+    metrics.push_str(&format!(
+        "storage_files_cached {{hostname=\"{}\"}} {}\n",
+        hostname,
+        storcaching::cached_file_count()
+    ));
 
     let disks = Disks::new_with_refreshed_list();
     for disk in disks.list() {
