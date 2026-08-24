@@ -5,7 +5,8 @@ use std::collections::{BinaryHeap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
 use toml::Table;
 
@@ -15,9 +16,23 @@ const DISK_SPACE_LOW_PERCENT: u64 = 12;
 const DISK_SPACE_RECOVER_PERCENT: u64 = 13;
 const HOUSEKEEPING_INTERVAL_SECS: u64 = 300;
 
-/// Housekeeping passes between two full recounts of the cache. At the default
-/// 300s interval this recounts once an hour.
-const CACHE_RECOUNT_EVERY_PASSES: u32 = 12;
+/// How long to wait between two full recounts of the cache.
+const CACHE_RECOUNT_INTERVAL_SECS: u64 = 3600;
+
+/// Share of wall-clock time the recount walk may spend actually reading cache
+/// directories; it sleeps for the rest.
+///
+/// The walk competes for the same disk as the request path, and it has no
+/// deadline of its own, so it yields instead of saturating the queue. Cold, a
+/// full walk is tens of seconds of solid random reads against the data disk,
+/// and while it runs every request that touches the cache queues behind it --
+/// long enough to time out the uptime probe. Paced, the same walk is spread
+/// over several minutes and leaves most of the disk to the request path.
+const RECOUNT_DUTY_CYCLE_PERCENT: u32 = 20;
+
+/// Longest the recount sleeps in one go, so a pathologically slow shard cannot
+/// stretch a single pause without bound.
+const RECOUNT_MAX_SLEEP: Duration = Duration::from_secs(5);
 
 /// Number of `.content` entries currently in the cache.
 ///
@@ -79,7 +94,19 @@ pub fn ensure_shard_dir(cache_dir: &str, hex: &str) -> std::io::Result<()> {
 /// that need file metadata pay for it themselves, on the entries they care
 /// about. Paths are handed to the callback instead of being collected, so a
 /// full walk does not have to materialise a vector of ~1M paths.
-fn visit_cache_files<F: FnMut(PathBuf)>(cache_dir: &str, mut visit: F) {
+fn visit_cache_files<F: FnMut(PathBuf)>(cache_dir: &str, visit: F) {
+    visit_cache_files_paced(cache_dir, visit, || {})
+}
+
+/// `visit_cache_files`, plus a hook that runs after each shard directory has
+/// been read. Callers that must not monopolise the disk throttle themselves
+/// there; a shard is the natural granularity, being one `read_dir` worth of
+/// work.
+fn visit_cache_files_paced<F, P>(cache_dir: &str, mut visit: F, mut at_shard_boundary: P)
+where
+    F: FnMut(PathBuf),
+    P: FnMut(),
+{
     let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(e) => {
@@ -100,10 +127,44 @@ fn visit_cache_files<F: FnMut(PathBuf)>(cache_dir: &str, mut visit: F) {
                     visit(sub_entry.path());
                 }
             }
+            at_shard_boundary();
         } else {
             visit(entry.path());
         }
     }
+}
+
+/// Throttles a maintenance walk to `RECOUNT_DUTY_CYCLE_PERCENT` of wall clock.
+///
+/// Self-tuning: the pause is proportional to the time the preceding burst of
+/// work actually took, so a warm walk whose directories are all in the dentry
+/// cache barely pauses at all, while a cold one that is hitting the disk for
+/// every entry backs off hard. Nothing has to know in advance which it is.
+struct Pacer {
+    burst_started: StdInstant,
+}
+
+impl Pacer {
+    fn new() -> Self {
+        Self {
+            burst_started: StdInstant::now(),
+        }
+    }
+
+    /// Sleep long enough that the work done since the last pause stays within
+    /// the duty cycle. Called from a blocking context, never a tokio worker.
+    fn pause(&mut self) {
+        thread::sleep(pause_after(self.burst_started.elapsed()));
+        self.burst_started = StdInstant::now();
+    }
+}
+
+/// How long to sleep after a burst of work that took `worked`, to hold the
+/// walk to `RECOUNT_DUTY_CYCLE_PERCENT` of wall clock.
+fn pause_after(worked: Duration) -> Duration {
+    let pause =
+        worked.saturating_mul(100 - RECOUNT_DUTY_CYCLE_PERCENT) / RECOUNT_DUTY_CYCLE_PERCENT;
+    pause.min(RECOUNT_MAX_SLEEP)
 }
 
 /// Is this a cache content entry (as opposed to a `.headers` sidecar or a
@@ -113,15 +174,24 @@ fn is_content_file(path: &Path) -> bool {
 }
 
 /// Count the cache entries with a `read_dir`-only walk and reset the counter to
-/// the result. Cheap enough to run periodically; the per-entry `metadata()`
-/// walk in `scan_cache_directory` is not.
+/// the result.
+///
+/// Cheaper than the per-entry `metadata()` walk in `scan_cache_directory`, but
+/// not cheap: ~1M directory entries across the shards, which is minutes of
+/// random reads once the dentry cache has been reclaimed. It is therefore
+/// paced, and must only be called from a blocking context.
 fn recount_cache_files(cache_dir: &str) -> usize {
     let mut total = 0;
-    visit_cache_files(cache_dir, |path| {
-        if is_content_file(&path) {
-            total += 1;
-        }
-    });
+    let mut pacer = Pacer::new();
+    visit_cache_files_paced(
+        cache_dir,
+        |path| {
+            if is_content_file(&path) {
+                total += 1;
+            }
+        },
+        || pacer.pause(),
+    );
     CACHED_FILES.store(total, AtomicOrdering::Relaxed);
     total
 }
@@ -526,29 +596,20 @@ where
 ///
 /// The per-tick work is deliberately cheap: a `statvfs` for the free space plus
 /// an in-memory counter for the cache size. The expensive walks only run when a
-/// limit is actually crossed, or once an hour to re-anchor the counter.
+/// limit is actually crossed.
+///
+/// Re-anchoring that counter is `recount_loop`'s job, on its own schedule. It
+/// used to run here, every twelfth tick, which meant a slow walk also held up
+/// the free-space check -- the one piece of housekeeping that has to stay
+/// responsive, since it is what keeps the disk from filling.
 pub async fn cache_loop(cache_dir: &str) {
     let config = get_cache_config();
     let cleanup_chunk_size = config.cleanup_chunk_size.max(1);
     let mut deleted_entries_counter: u64 = 0;
     let mut reclaimed_bytes_counter: u64 = 0;
     let mut next_log = Instant::now();
-    // Force a recount on the first pass, before any limit is evaluated.
-    let mut passes_since_recount = CACHE_RECOUNT_EVERY_PASSES;
 
     loop {
-        if passes_since_recount >= CACHE_RECOUNT_EVERY_PASSES {
-            let dir = cache_dir.to_string();
-            if blocking("recount", move || recount_cache_files(&dir))
-                .await
-                .is_some()
-            {
-                passes_since_recount = 0;
-            }
-        } else {
-            passes_since_recount += 1;
-        }
-
         if cached_file_count() > MAX_CACHE_FILES {
             let dir = cache_dir.to_string();
             if let Some((limit_outcome, total_files)) = blocking("file limit", move || {
@@ -606,6 +667,23 @@ pub async fn cache_loop(cache_dir: &str) {
         }
 
         tokio::time::sleep(Duration::from_secs(HOUSEKEEPING_INTERVAL_SECS)).await;
+    }
+}
+
+/// Periodically re-anchor the cached-file counter against the filesystem.
+///
+/// The counter is maintained incrementally by the download and deletion paths,
+/// so it drifts: racing downloads of the same object double-count, and files
+/// removed behind our back are never subtracted. Nothing here is urgent -- the
+/// counter guards a 1M-entry cap that a drift of a few thousand cannot hide --
+/// so the walk is paced and runs well away from the housekeeping loop.
+pub async fn recount_loop(cache_dir: &str) {
+    loop {
+        let dir = cache_dir.to_string();
+        if let Some(total) = blocking("recount", move || recount_cache_files(&dir)).await {
+            debug_log!("Cache recount: {} entries", total);
+        }
+        tokio::time::sleep(Duration::from_secs(CACHE_RECOUNT_INTERVAL_SECS)).await;
     }
 }
 
@@ -750,5 +828,55 @@ mod tests {
         assert_eq!(scan.total_files, 2);
         assert_eq!(scan.oldest_files.len(), 2);
         assert_eq!(cached_file_count(), 2);
+    }
+
+    #[test]
+    fn recount_pauses_in_proportion_to_the_work_it_did() {
+        // A warm shard costs almost nothing, so the pause is negligible too.
+        assert_eq!(
+            pause_after(Duration::from_millis(4)),
+            Duration::from_millis(16)
+        );
+
+        // A cold one backs off to the configured duty cycle: four parts idle
+        // for every one part reading.
+        assert_eq!(pause_after(Duration::from_secs(1)), Duration::from_secs(4));
+
+        // However slow a single shard gets, one pause stays bounded.
+        assert_eq!(pause_after(Duration::from_secs(600)), RECOUNT_MAX_SLEEP);
+
+        assert_eq!(pause_after(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn paced_walk_visits_every_entry_and_pauses_once_per_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        touch(&root.join("ab/one.content"));
+        touch(&root.join("ab/two.content"));
+        touch(&root.join("cd/three.content"));
+        touch(&root.join("legacy.content"));
+
+        let mut seen = Vec::new();
+        let mut shards = 0;
+        visit_cache_files_paced(
+            root.to_str().unwrap(),
+            |path| seen.push(path.file_name().unwrap().to_str().unwrap().to_string()),
+            || shards += 1,
+        );
+
+        seen.sort();
+        assert_eq!(
+            seen,
+            [
+                "legacy.content",
+                "one.content",
+                "three.content",
+                "two.content"
+            ]
+        );
+        // Once per shard directory, and not for the legacy file in the root.
+        assert_eq!(shards, 2);
     }
 }
