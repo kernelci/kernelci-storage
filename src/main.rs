@@ -108,6 +108,10 @@ type FileSemaphores = Arc<StdMutex<HashMap<String, Arc<Semaphore>>>>;
 #[derive(Clone)]
 struct AppState {
     file_locks: FileSemaphores,
+    /// Process-wide cap for backend writes originating from archive requests.
+    /// All concurrent `/v1/archive` requests share this semaphore, preventing
+    /// their per-request fan-out from multiplying without bound.
+    archive_uploads: Arc<Semaphore>,
 }
 
 /// Read granularity for streaming a cached file back to the client.
@@ -136,14 +140,12 @@ fn stream_chunk_bytes() -> usize {
 const ARCHIVE_MAX_FILES: usize = 10_000;
 const ARCHIVE_MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const ARCHIVE_MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
-// Archive uploads are latency-bound: each small file costs one Azure
-// round-trip (single-shot Put Blob over a pooled connection), so throughput
-// scales almost linearly with concurrency. Azure Blob comfortably handles
-// hundreds of concurrent requests; 64 keeps multi-thousand-file archives
-// well under reverse-proxy timeouts. Memory stays modest because small
-// uploads use a 256KB probe buffer and only files larger than that grow to
-// a 10MB chunk buffer; tune via KCI_STORAGE_ARCHIVE_PARALLELISM.
-const ARCHIVE_DEFAULT_PARALLELISM: usize = 64;
+// Archive uploads are latency-bound, but letting each concurrent archive
+// independently fan out backend writes can starve the request runtime. Keep a
+// single process-wide budget. Waiting for a permit is asynchronous, so excess
+// archive entries queue without occupying worker threads. Tune via
+// KCI_STORAGE_ARCHIVE_PARALLELISM.
+const ARCHIVE_DEFAULT_PARALLELISM: usize = 16;
 
 struct ExtractedArchiveEntry {
     storage_path: String,
@@ -692,6 +694,7 @@ async fn async_main() {
         .unwrap_or(3000);
     let state = AppState {
         file_locks: Arc::new(StdMutex::new(HashMap::new())),
+        archive_uploads: Arc::new(Semaphore::new(archive_parallelism())),
     };
     debug_log!("Starting server, tls: {:?}", tlscfg);
 
@@ -1126,6 +1129,21 @@ async fn upload_extracted_archive_entry(
             }
         };
 
+    // Acquire the process-wide permit only after this path's lock. A duplicate
+    // upload waiting on the same object must not consume capacity that another
+    // archive entry could use. Semaphore::acquire() yields asynchronously.
+    let archive_permit = match state.archive_uploads.acquire().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            drop(permit);
+            cleanup_semaphore(&state.file_locks, &entry.storage_path);
+            return Err(format!(
+                "{}: global archive upload semaphore closed",
+                entry.storage_path
+            ));
+        }
+    };
+
     let upload_result = async {
         let mut input = tokio::fs::File::open(&entry.temp_path).await.map_err(|e| {
             format!(
@@ -1157,6 +1175,7 @@ async fn upload_extracted_archive_entry(
     }
     .await;
 
+    drop(archive_permit);
     drop(permit);
     cleanup_semaphore(&state.file_locks, &entry.storage_path);
     upload_result
@@ -2158,4 +2177,28 @@ async fn ax_list_files() -> (StatusCode, String) {
     // generate nice list of files, with one file per line
     let files_str = files.join("\n");
     (StatusCode::OK, files_str)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cloned_app_states_share_archive_upload_capacity() {
+        let state = AppState {
+            file_locks: Arc::new(StdMutex::new(HashMap::new())),
+            archive_uploads: Arc::new(Semaphore::new(2)),
+        };
+        let other_request = state.clone();
+
+        let first = state.archive_uploads.acquire().await.unwrap();
+        let second = other_request.archive_uploads.acquire().await.unwrap();
+
+        assert!(state.archive_uploads.try_acquire().is_err());
+
+        drop(first);
+        assert!(other_request.archive_uploads.try_acquire().is_ok());
+
+        drop(second);
+    }
 }
