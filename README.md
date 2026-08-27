@@ -212,7 +212,7 @@ curl -X POST http://localhost:3000/v1/archive \
     -F "archive=@dtbs.tar.xz"
 ```
 
-Archive entries are stored under the requested prefix. The server rejects path traversal, absolute paths, links, devices, and other non-regular files. Upload concurrency defaults to 4 files and can be adjusted with `KCI_STORAGE_ARCHIVE_PARALLELISM`.
+Archive entries are stored under the requested prefix. The server rejects path traversal, absolute paths, links, devices, and other non-regular files. Backend writes from all concurrent archive requests share one process-wide asynchronous limit of 16 by default. Adjust it with `KCI_STORAGE_ARCHIVE_PARALLELISM`.
 
 ### Metrics
 
