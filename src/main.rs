@@ -15,9 +15,10 @@ mod download_challenge;
 mod local;
 #[macro_use]
 mod logging;
-mod subnet;
+mod monitor;
 mod storcaching;
 mod storjwt;
+mod subnet;
 mod useragent;
 
 use async_trait::async_trait;
@@ -665,18 +666,22 @@ fn main() {
         .map(|n| n.get())
         .unwrap_or(1)
         .max(16);
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
+        // Label scheduler workers vs blocking-pool threads for the stall monitor.
+        .thread_name_fn(monitor::thread_namer(worker_threads))
         .enable_all()
         .build()
-        .expect("failed to build tokio runtime")
-        .block_on(async_main());
+        .expect("failed to build tokio runtime");
+    runtime.block_on(async_main());
 }
 
 async fn async_main() {
     logging::init(get_args().verbose);
     tracing_subscriber::fmt::init();
     let tlscfg = initial_setup().await;
+    // Watches the runtime from a plain OS thread and reports stalls; see monitor.rs.
+    monitor::start(tokio::runtime::Handle::current());
     subnet::init().unwrap_or_else(|error| {
         eprintln!("Invalid block_subnets configuration: {error}");
         std::process::exit(1);

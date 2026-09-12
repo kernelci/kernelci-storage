@@ -171,6 +171,27 @@ curl -X GET https://localhost:3000/v1/checkauth \
 
 - `KCI_STORAGE_CONFIG` - Override config file path (defaults to config.toml)
 - `STORAGE_DEBUG` - Enable debug logging
+- `STORAGE_MONITOR_SECS` - Interval of the runtime stall monitor (default 15, `0` disables it)
+
+### Runtime Stall Monitor
+
+A dedicated OS thread (not a tokio task, so it keeps running when the async
+runtime is wedged) checks the server every `STORAGE_MONITOR_SECS` seconds and
+prints to stderr only when something is unusual:
+
+- `event=runtime_stall` / `event=runtime_recovered` - a trivial task spawned onto the
+  runtime did not run within 5 seconds; while stalled, a thread dump
+  (`event=monitor_dump` + one `event=monitor_thread` line per non-idle thread with
+  its state, current syscall, wait channel and, where the kernel allows it, kernel
+  stack) is printed at most once a minute.
+- `event=monitor_warn` - a worker thread neither parked nor went idle for a whole
+  interval (blocked in a syscall or hogging the CPU), several threads are in
+  uninterruptible sleep, the scheduling probe was slow, or the task or
+  blocking-thread counts are far outside normal.
+
+Runtime threads are named `rt-worker-NN` (scheduler workers) and `rt-blocking-NN`
+(blocking pool) so dumps, `top -H` and `/proc/<pid>/task` tell them apart. With
+`STORAGE_DEBUG` set, a `monitor_tick` summary line is printed every interval.
 
 ## API
 
