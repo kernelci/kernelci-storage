@@ -65,27 +65,29 @@ fn ensure_directory_exists(file_path: &Path) -> Result<(), std::io::Error> {
 }
 
 /// Get full file path in storage directory
-fn get_storage_file_path(filename: &str) -> PathBuf {
+fn get_storage_file_path(filename: &str) -> Result<PathBuf, String> {
     let config = get_local_config();
-    let storage_path = Path::new(&config.storage_path);
-    // Strip leading slashes to ensure the path is always relative to storage root
-    let safe_name = filename.trim_start_matches('/');
-    let full = storage_path.join(safe_name);
-    // Defense-in-depth: verify resolved path stays within storage root
-    let canonical_storage = storage_path
-        .canonicalize()
-        .unwrap_or_else(|_| storage_path.to_path_buf());
-    // Use the parent directory for canonicalization since the file may not exist yet
-    let parent = full.parent().unwrap_or(&full);
-    let canonical_parent = parent
-        .canonicalize()
-        .unwrap_or_else(|_| parent.to_path_buf());
-    if !canonical_parent.starts_with(&canonical_storage) {
-        // Fall back to storage root to prevent escape
-        storage_path.join(Path::new(safe_name).file_name().unwrap_or_default())
-    } else {
-        full
+    resolve_storage_file_path(Path::new(&config.storage_path), filename)
+}
+
+fn resolve_storage_file_path(storage_path: &Path, filename: &str) -> Result<PathBuf, String> {
+    let filename = crate::normalize_storage_path(filename)?;
+    let root = storage_path.canonicalize().map_err(|e| e.to_string())?;
+    let mut resolved = root.clone();
+    for component in Path::new(&filename).components() {
+        resolved.push(component);
+        match fs::symlink_metadata(&resolved) {
+            Ok(_) => {
+                resolved = resolved.canonicalize().map_err(|e| e.to_string())?;
+                if !resolved.starts_with(&root) {
+                    return Err("Path resolves outside storage directory".to_string());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
     }
+    Ok(resolved)
 }
 
 /// Get metadata file path for storing headers. Pure path arithmetic: the read
@@ -139,7 +141,8 @@ async fn write_file_to_local_streaming(
     cont_type: String,
     owner_email: Option<String>,
 ) -> Result<(String, usize), String> {
-    let file_path = get_storage_file_path(&filename);
+    fs::create_dir_all(&get_local_config().storage_path).map_err(|e| e.to_string())?;
+    let file_path = get_storage_file_path(&filename)?;
 
     // Ensure directory structure exists
     if let Err(e) = ensure_directory_exists(&file_path) {
@@ -188,7 +191,8 @@ fn write_file_to_local(
     cont_type: String,
     owner_email: Option<String>,
 ) -> Result<String, String> {
-    let file_path = get_storage_file_path(&filename);
+    fs::create_dir_all(&get_local_config().storage_path).map_err(|e| e.to_string())?;
+    let file_path = get_storage_file_path(&filename)?;
 
     // Ensure directory structure exists
     if let Err(e) = ensure_directory_exists(&file_path) {
@@ -253,9 +257,11 @@ fn get_headers_from_metadata_file(filename: &str) -> HeaderMap {
 /// itself (one syscall instead of two) and saves the GET handler a separate
 /// stat and open on the async worker threads.
 fn get_file_from_local(filename: String) -> ReceivedFile {
-    let file_path = get_storage_file_path(&filename);
-
     let mut received_file = ReceivedFile::not_found(filename.clone(), CacheState::Cached);
+    let file_path = match get_storage_file_path(&filename) {
+        Ok(path) => path,
+        Err(_) => return received_file,
+    };
 
     let file = match File::open(&file_path) {
         Ok(file) => file,
@@ -447,5 +453,48 @@ impl super::Driver for LocalDriver {
                 eprintln!("Local storage list_files task panicked: {}", e);
                 Vec::new()
             })
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn new_directories_keep_their_full_path() {
+        let root = tempfile::tempdir_in(".").unwrap();
+        let relative = root
+            .path()
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap_or(root.path());
+        let resolved = resolve_storage_file_path(relative, "new/dir/file.txt").unwrap();
+        assert_eq!(
+            resolved,
+            root.path().canonicalize().unwrap().join("new/dir/file.txt")
+        );
+        assert!(resolve_storage_file_path(relative, "new/../../outside.txt").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_symlinks_must_resolve_inside_root() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("file.txt"), "outside").unwrap();
+        symlink(outside.path(), root.path().join("outside")).unwrap();
+        symlink(
+            outside.path().join("file.txt"),
+            root.path().join("link.txt"),
+        )
+        .unwrap();
+        assert!(resolve_storage_file_path(root.path(), "outside/new.txt").is_err());
+        assert!(resolve_storage_file_path(root.path(), "link.txt").is_err());
+        std::fs::create_dir(root.path().join("inside")).unwrap();
+        symlink(root.path().join("inside"), root.path().join("alias")).unwrap();
+        assert_eq!(
+            resolve_storage_file_path(root.path(), "alias/new.txt").unwrap(),
+            root.path().join("inside/new.txt")
+        );
     }
 }

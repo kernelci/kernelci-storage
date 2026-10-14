@@ -103,6 +103,10 @@ struct TestServer {
 
 impl TestServer {
     fn start() -> Self {
+        Self::start_with_settings(false, "")
+    }
+
+    fn start_with_settings(relative_storage: bool, settings: &str) -> Self {
         let work_dir = tempfile::TempDir::new().expect("Failed to create temp dir");
         let port = get_free_port();
 
@@ -113,7 +117,8 @@ impl TestServer {
         // Write test config
         let config_path = work_dir.path().join("config.toml");
         let config_content = format!(
-            r#"driver="local"
+            r#"{settings}
+driver="local"
 jwt_secret="{JWT_SECRET}"
 
 [download_challenge]
@@ -142,7 +147,11 @@ cleanup_chunk_size=100000
 [retention]
 tag_value = "6m"
 "#,
-            storage_path.display()
+            if relative_storage {
+                "./storage".to_string()
+            } else {
+                storage_path.display().to_string()
+            }
         );
         std::fs::write(&config_path, &config_content).unwrap();
 
@@ -1096,4 +1105,348 @@ fn test_large_file_upload() {
     assert_eq!(resp.status(), 200);
     let body = resp.bytes().unwrap();
     assert_eq!(body.len(), expected_len, "Downloaded file size mismatch");
+}
+
+#[test]
+fn test_relative_storage_preserves_new_subdirectories() {
+    let server = TestServer::start_with_settings(true, "");
+    std::fs::remove_dir(server.work_dir.path().join("storage")).unwrap();
+    let form = multipart::Form::new().text("path", "new/deep/path").part(
+        "file0",
+        multipart::Part::bytes(b"nested".to_vec()).file_name("file.txt"),
+    );
+    let resp = server
+        .client()
+        .post(server.url("/v1/file"))
+        .header(
+            "Authorization",
+            format!("Bearer {}", generate_token(TEST_EMAIL)),
+        )
+        .multipart(form)
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        std::fs::read(
+            server
+                .work_dir
+                .path()
+                .join("storage/new/deep/path/file.txt")
+        )
+        .unwrap(),
+        b"nested"
+    );
+    assert!(!server.work_dir.path().join("storage/file.txt").exists());
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/new/deep/path/file.txt"))
+            .send()
+            .unwrap()
+            .bytes()
+            .unwrap()
+            .as_ref(),
+        b"nested"
+    );
+}
+
+#[test]
+fn test_sibling_prefix_is_denied_in_both_multipart_orders_and_archive() {
+    let server = TestServer::start();
+    let token = generate_token(RESTRICTED_EMAIL);
+    for endpoint in ["/v1/file", "/upload"] {
+        for file_first in [false, true] {
+            let file = multipart::Part::bytes(b"data".to_vec()).file_name("file.txt");
+            let form = if file_first {
+                multipart::Form::new()
+                    .part("file0", file)
+                    .text("path", "restricted-area-other")
+            } else {
+                multipart::Form::new()
+                    .text("path", "restricted-area-other")
+                    .part("file0", file)
+            };
+            let resp = server
+                .client()
+                .post(server.url(endpoint))
+                .header("Authorization", format!("Bearer {token}"))
+                .multipart(form)
+                .send()
+                .unwrap();
+            assert_eq!(resp.status(), 403);
+        }
+    }
+    let form = multipart::Form::new()
+        .text("path", "restricted-area-other")
+        .part(
+            "archive",
+            multipart::Part::bytes(build_tar_archive(&[("file.txt", b"data")]))
+                .file_name("files.tar"),
+        );
+    assert_eq!(
+        server
+            .client()
+            .post(server.url("/v1/archive"))
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    assert!(!server
+        .work_dir
+        .path()
+        .join("storage/restricted-area-other")
+        .exists());
+}
+
+#[test]
+fn test_malformed_upload_fields_return_bad_request() {
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let form = multipart::Form::new()
+        .part("path", multipart::Part::bytes(vec![255]))
+        .part(
+            "file0",
+            multipart::Part::bytes(b"data".to_vec()).file_name("file.txt"),
+        );
+    assert_eq!(
+        server
+            .client()
+            .post(server.url("/v1/file"))
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .unwrap()
+            .status(),
+        400
+    );
+    for file_first in [false, true] {
+        let file = multipart::Part::bytes(b"data".to_vec()).file_name("file.txt");
+        let form = if file_first {
+            multipart::Form::new()
+                .part("file0", file)
+                .text("path", "path")
+        } else {
+            multipart::Form::new()
+                .text("path", "path")
+                .part("file0", file)
+        };
+        assert_eq!(
+            server
+                .client()
+                .post(server.url("/v1/file"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header(
+                    "Content-Type-Upstream",
+                    reqwest::header::HeaderValue::from_bytes(&[255]).unwrap()
+                )
+                .multipart(form)
+                .send()
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/"))
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn test_direct_forwarded_headers_do_not_override_subnet_matching() {
+    let server = TestServer::start_with_settings(false, "block_subnets=['198.51.100.0/24']");
+    for header in ["X-Forwarded-For", "Forwarded"] {
+        let value = if header == "Forwarded" {
+            "for=198.51.100.2"
+        } else {
+            "198.51.100.2"
+        };
+        assert_eq!(
+            server
+                .client()
+                .get(server.url("/"))
+                .header(header, value)
+                .send()
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+    let server = TestServer::start_with_settings(
+        false,
+        "trusted_proxies=['127.0.0.1/32']\nblock_subnets=['198.51.100.0/24']",
+    );
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/"))
+            .header("X-Forwarded-For", "203.0.113.9, 198.51.100.2")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+}
+
+#[test]
+fn test_zero_offset_and_invalid_ranges() {
+    let server = TestServer::start();
+    std::fs::write(
+        server.work_dir.path().join("storage/range.bin"),
+        b"0123456789abcdef",
+    )
+    .unwrap();
+    for (range, status, length) in [
+        ("bytes=0-0", 206, 1),
+        ("bytes=0-", 206, 16),
+        ("bytes=10-5", 416, 0),
+        ("bytes=0-invalid", 416, 0),
+        ("items=1-5", 416, 0),
+    ] {
+        let resp = server
+            .client()
+            .get(server.url("/range.bin"))
+            .header("Range", range)
+            .send()
+            .unwrap();
+        assert_eq!(resp.status(), status, "{range}");
+        if length > 0 {
+            assert_eq!(resp.bytes().unwrap().len(), length);
+        }
+    }
+    std::fs::write(server.work_dir.path().join("storage/empty.bin"), "").unwrap();
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/empty.bin"))
+            .header("Range", "bytes=0-")
+            .send()
+            .unwrap()
+            .status(),
+        416
+    );
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/empty.bin"))
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+}
+
+#[test]
+fn test_buffered_upload_waits_for_existing_upload() {
+    use std::io::Read;
+    let server = TestServer::start();
+    let token = generate_token(TEST_EMAIL);
+    let boundary = "slowBoundary";
+    let prefix = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\nbusy\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file0\"; filename=\"file.txt\"\r\n\r\n");
+    let suffix = format!("\r\n--{boundary}--\r\n");
+    let mut slow = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    slow.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let head = format!("POST /v1/file HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nAuthorization: Bearer {token}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\n\r\n", prefix.len() + 10000 + suffix.len());
+    slow.write_all(head.as_bytes()).unwrap();
+    slow.write_all(prefix.as_bytes()).unwrap();
+    slow.write_all(&vec![b'x'; 10000]).unwrap();
+    let file = server.work_dir.path().join("storage/busy/file.txt");
+    for _ in 0..100 {
+        if file.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(file.exists());
+    let finish = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        slow.write_all(suffix.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        slow.read_to_end(&mut response).unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+    });
+    let form = multipart::Form::new()
+        .part(
+            "file0",
+            multipart::Part::bytes(b"replacement".to_vec()).file_name("file.txt"),
+        )
+        .text("path", "busy");
+    assert_eq!(
+        server
+            .client()
+            .post(server.url("/v1/file"))
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .unwrap()
+            .status(),
+        200
+    );
+    finish.join().unwrap();
+    assert_eq!(std::fs::read(file).unwrap(), b"replacement");
+}
+
+#[test]
+fn test_invalid_user_configuration_is_rejected_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(
+        &config,
+        "driver='local'\njwt_secret='test'\n[users.alice]\nprefixes=['area']\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_kernelci-storage"))
+        .args([
+            "--files-directory",
+            dir.path().to_str().unwrap(),
+            "--config-file",
+            config.to_str().unwrap(),
+        ])
+        .env("KCI_STORAGE_CONFIG", &config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid users configuration"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("panicked"));
+}
+
+#[test]
+fn test_forwarded_header_selection_and_malformed_leftmost_input() {
+    let server = TestServer::start_with_settings(false, "trusted_proxies=['127.0.0.1/32']\ntrusted_proxy_header='forwarded'\nblock_subnets=['198.51.100.0/24']");
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/"))
+            .header("X-Forwarded-For", "203.0.113.9")
+            .header(
+                "Forwarded",
+                r#"for=garbage, for=198.51.100.7;host="example.test,foo;for=203.0.113.9""#
+            )
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
+    let server = TestServer::start_with_settings(
+        false,
+        "trusted_proxies=['127.0.0.1/32']\nblock_subnets=['198.51.100.0/24']",
+    );
+    assert_eq!(
+        server
+            .client()
+            .get(server.url("/"))
+            .header("X-Forwarded-For", "garbage, 198.51.100.7")
+            .send()
+            .unwrap()
+            .status(),
+        403
+    );
 }

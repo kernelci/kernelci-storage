@@ -3,7 +3,7 @@
 This is a simple storage server that supports file upload and download, with token based authentication.
 It supports multiple backends: Azure Blob Storage and local filesystem, to provide user transparent storage.
 It caches the files in a local directory and serves them from there.
-Range requests are supported, but only for start offset, end limit is not implemented yet.
+Single byte ranges support start offsets and optional end limits.
 Files are protected by upload locking to prevent concurrent uploads to the same path.
 To limit disk usage, a background housekeeping loop samples disk space every five minutes, keeps the cache below 1,000,000 items, and deletes the oldest cached files in configurable batches (default 100,000 files) whenever the file-count or disk-space thresholds are exceeded. A housekeeping summary is logged every five minutes showing the current free space, cache size, and any clean-up actions taken.
 
@@ -106,9 +106,19 @@ requests receive `403 Forbidden` before reaching a handler and are logged as
 `event=subnet_ban`. Invalid CIDRs prevent the server from starting, and a
 restart is required after changing the list.
 
-When running behind a reverse proxy, ensure it overwrites the forwarded-client
-headers and prevent direct access to the storage origin. The server uses the
-same resolved client IP for access logging and subnet matching.
+Forwarded client addresses are used only when the connection comes from a
+configured proxy. Add its CIDRs at the top level of the configuration:
+
+```toml
+trusted_proxies = ["127.0.0.1/32", "10.0.0.0/24"]
+trusted_proxy_header = "x-forwarded-for"  # or "forwarded"
+```
+
+The default is an empty list, which uses the connection address. The server
+walks the forwarded chain from right to left and uses the first address outside
+these proxy ranges for logging, subnet matching, and challenge cookies. Configure
+only your proxy addresses and select the header your proxy appends or overwrites.
+The default header is `x-forwarded-for`; the other header family is ignored. Invalid proxy CIDRs prevent startup.
 
 ### Browser Download Challenge
 
@@ -137,8 +147,7 @@ logs challenged requests as `event=download_challenge`.
 
 This is a lightweight defense against clients that do not execute the browser
 flow, not proof that a client is human. Keep backend concurrency and rate
-limits in place. When using forwarded client-IP headers, the reverse proxy must
-overwrite them and direct origin access must be prevented.
+limits in place. Configure `trusted_proxies` when a proxy supplies client addresses.
 
 ## Creating user tokens
 
@@ -152,7 +161,10 @@ JWT secret is configured in the `config.toml` file.
 # Generate JWT token for a user
 ./kernelci-storage --generate-jwt-token user@email.com
 ```
-The first command generates a JWT secret for your configuration, the second generates a token for the specified user.
+The first command generates a JWT secret for your configuration; the second
+generates a token for the specified user with a 24-hour lifetime. Supplied
+expiration claims are checked without a grace period. Existing tokens without
+an expiration claim remain accepted for compatibility.
 
 ### Testing Token Validity
 
@@ -205,7 +217,12 @@ Runtime threads are named `rt-worker-NN` (scheduler workers) and `rt-blocking-NN
 - `GET /v1/list` - List all files (public)
 - `GET /metrics` - Prometheus metrics endpoint
 
-The server supports large file uploads up to 4GB and includes upload conflict protection to prevent concurrent uploads to the same file path. Downloads have a 30-second timeout for acquiring file locks.
+The server supports uploads up to 4GB. Uploads in either multipart field order
+and downloads wait up to 30 seconds for an existing operation on the same path.
+Buffered uploads and extracted archives use the workspace's `download/`
+directory, so reserve space there for both the archive and its extracted files.
+Upload prefixes match whole path components; leading and trailing slashes are
+optional. Invalid `[[users]]` configurations are rejected at startup.
 
 ### Uploading Files with curl
 

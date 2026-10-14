@@ -1,4 +1,3 @@
-use crate::get_config_content;
 use serde::Deserialize;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
@@ -8,7 +7,6 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::thread;
 use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 use tokio::time::{Duration, Instant};
-use toml::Table;
 
 const MAX_CACHE_FILES: usize = 1_000_000;
 const DEFAULT_CLEANUP_CHUNK: usize = 100_000;
@@ -41,6 +39,9 @@ const RECOUNT_MAX_SLEEP: Duration = Duration::from_secs(5);
 /// touching the filesystem. It is only an estimate between recounts:
 /// concurrent downloads of the same object, or files removed behind our back,
 /// make it drift, and `recount_cache_files` resets it periodically.
+#[cfg(test)]
+pub(crate) static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 static CACHED_FILES: AtomicUsize = AtomicUsize::new(0);
 
 /// Record that a new `.content` entry was published into the cache.
@@ -276,8 +277,7 @@ fn default_cleanup_chunk_size() -> usize {
 }
 
 fn get_cache_config() -> CacheConfig {
-    let cfg_content = get_config_content();
-    let cfg: Table = toml::from_str(cfg_content).unwrap_or_else(|_| Table::new());
+    let cfg = crate::get_config_table();
     let cleanup_chunk_size = cfg
         .get("cache")
         .and_then(|section| section.get("cleanup_chunk_size"))
@@ -413,11 +413,11 @@ fn freediskspace_percent(cache_dir: &str) -> u64 {
 fn delete_cache_file(file: &str) -> CleanOutcome {
     // Truncate from filename .content, and add .headers, delete both files
     let content_filename = file.to_string();
-    let headers_filename = file.replace(".content", ".headers");
+    let headers_filename = Path::new(file).with_extension("headers");
     debug_log!(
         "Deleting files: {} {}",
         &content_filename,
-        &headers_filename
+        headers_filename.display()
     );
     let mut outcome = CleanOutcome::default();
     let content_size = fs::metadata(&content_filename)
@@ -441,7 +441,7 @@ fn delete_cache_file(file: &str) -> CleanOutcome {
             outcome.reclaimed_bytes += header_size;
         }
         Err(_) => {
-            debug_log!("Error deleting file: {}", headers_filename);
+            debug_log!("Error deleting file: {}", headers_filename.display());
         }
     }
     outcome
@@ -699,6 +699,13 @@ fn remove_zero_sized_files(cache_dir: &str) -> u64 {
         if !metadata.is_file() || metadata.len() != 0 {
             return;
         }
+        // An empty object (or empty sidecar) is valid when its pair exists.
+        if (is_content_file(&path) && path.with_extension("headers").is_file())
+            || (path.extension().is_some_and(|ext| ext == "headers")
+                && path.with_extension("content").is_file())
+        {
+            return;
+        }
 
         if let Err(e) = fs::remove_file(&path) {
             debug_log!("Failed to remove zero-sized file {:?}: {}", path, e);
@@ -785,6 +792,7 @@ mod tests {
     /// test rather than several that would race each other.
     #[test]
     fn cache_file_counter_tracks_the_cache() {
+        let _counter_lock = COUNTER_TEST_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let cache_dir = root.to_str().unwrap();
@@ -878,5 +886,21 @@ mod tests {
         );
         // Once per shard directory, and not for the legacy file in the root.
         assert_eq!(shards, 2);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[test]
+    fn startup_validation_preserves_complete_empty_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = dir.path().join("empty.content");
+        let headers = dir.path().join("empty.headers");
+        fs::write(&content, "").unwrap();
+        fs::write(&headers, "content-type:application/octet-stream\n").unwrap();
+        assert_eq!(remove_zero_sized_files(dir.path().to_str().unwrap()), 0);
+        assert_eq!(remove_orphan_files(dir.path().to_str().unwrap()), 0);
+        assert!(content.exists() && headers.exists());
     }
 }

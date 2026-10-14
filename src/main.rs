@@ -11,6 +11,7 @@
 */
 
 mod azure;
+mod client_ip;
 mod download_challenge;
 mod local;
 #[macro_use]
@@ -165,11 +166,37 @@ struct ArchiveResponse {
     failures: Vec<String>,
 }
 
-fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> Arc<Semaphore> {
+struct FileLock {
+    semaphore: Option<Arc<Semaphore>>,
+    locks: FileSemaphores,
+    filename: String,
+}
+
+impl std::ops::Deref for FileLock {
+    type Target = Semaphore;
+    fn deref(&self) -> &Semaphore {
+        self.semaphore.as_ref().unwrap()
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        self.semaphore.take();
+        cleanup_semaphore(&self.locks, &self.filename);
+    }
+}
+
+fn get_or_create_semaphore(locks: &FileSemaphores, filename: &str) -> FileLock {
     let mut map = locks.lock().unwrap_or_else(|e| e.into_inner());
-    map.entry(filename.to_string())
+    let semaphore = map
+        .entry(filename.to_string())
         .or_insert_with(|| Arc::new(Semaphore::new(1)))
-        .clone()
+        .clone();
+    FileLock {
+        semaphore: Some(semaphore),
+        locks: locks.clone(),
+        filename: filename.to_string(),
+    }
 }
 
 /// Remove semaphore entries that are no longer in use (strong_count == 1 means
@@ -496,37 +523,7 @@ pub fn get_retention_tag() -> Option<(String, String)> {
 }
 
 pub(crate) fn client_ip_from_headers(headers: &HeaderMap, fallback: SocketAddr) -> String {
-    if let Some(forwarded_for) = headers
-        .get("X-Forwarded-For")
-        .and_then(|value| value.to_str().ok())
-    {
-        if let Some(first_ip) = forwarded_for
-            .split(',')
-            .map(|part| part.trim())
-            .find(|part| !part.is_empty())
-        {
-            return first_ip.to_string();
-        }
-    }
-
-    if let Some(forwarded) = headers
-        .get("Forwarded")
-        .and_then(|value| value.to_str().ok())
-    {
-        for entry in forwarded.split(',') {
-            for directive in entry.split(';') {
-                let directive = directive.trim();
-                if let Some(value) = directive.strip_prefix("for=") {
-                    let cleaned = value.trim_matches('"');
-                    if !cleaned.is_empty() {
-                        return cleaned.to_string();
-                    }
-                }
-            }
-        }
-    }
-
-    fallback.ip().to_string()
+    client_ip::resolve(headers, fallback).to_string()
 }
 
 /// Initial variables configuration and checks
@@ -573,7 +570,7 @@ async fn initial_setup() -> Option<RustlsConfig> {
         }
     }
 
-    let _validation = tokio::spawn(storcaching::validate_cache(cache_dir.to_string()));
+    storcaching::validate_cache(cache_dir.to_string()).await;
     let _recount = tokio::spawn(storcaching::recount_loop(cache_dir));
     let _handle = tokio::spawn(storcaching::cache_loop(cache_dir));
 
@@ -693,6 +690,14 @@ async fn async_main() {
     // Build the driver up front so an unknown driver name is rejected at
     // startup rather than on the first request; it is cached from here on.
     let _ = driver();
+    if let Err(error) = validate_users_config(get_config_table()) {
+        eprintln!("Invalid users configuration: {error}");
+        std::process::exit(1);
+    }
+    if let Err(error) = client_ip::init() {
+        eprintln!("Invalid trusted_proxies configuration: {error}");
+        std::process::exit(1);
+    }
     let port: u16 = std::env::var("KCI_STORAGE_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -825,27 +830,45 @@ fn heuristic_filetype(filename: String) -> String {
 /*
 Example config.toml section:
 
-[users]
-[users.alice]
+[[users]]
+name = "alice"
 prefixes = ["/alice"]
-[users.bob]
-prefixes = ["/bob"]
-[users.admin]
-prefixes = [""]
 */
 
 fn validate_path(path: &str) -> Result<(), String> {
     if path.contains("..") {
         return Err("Path traversal detected".to_string());
     }
+    if path.chars().any(char::is_control) {
+        return Err("Path must not contain control characters".to_string());
+    }
     Ok(())
+}
+
+fn normalize_storage_path(path: &str) -> Result<String, String> {
+    validate_path(path)?;
+    Ok(path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/"))
+}
+
+fn storage_key(path: &str) -> Result<String, String> {
+    validate_path(path)?;
+    // Keep lock/cache keys consistent with the backend's effective object key.
+    if get_driver_type() == "local" {
+        normalize_storage_path(path)
+    } else {
+        Ok(azure::normalize_blob_key(path))
+    }
 }
 
 /// Build a normalized, validated storage key from the upload path and filename.
 /// Strips trailing slashes from `path`, joins with `filename`, strips leading slashes,
 /// and validates against path traversal.
 fn build_storage_key(path: &mut String, filename: &str) -> Result<String, String> {
-    // Remove trailing slash
+    validate_path(path)?;
     if path.ends_with('/') {
         path.pop();
     }
@@ -855,36 +878,59 @@ fn build_storage_key(path: &mut String, filename: &str) -> Result<String, String
         format!("{}/{}", path, filename)
     };
     // Normalize: strip leading slashes so the path is always relative
-    let full_path = full_path.trim_start_matches('/').to_string();
-    validate_path(&full_path)?;
+    let full_path = storage_key(&full_path)?;
+    if full_path.is_empty() {
+        return Err("Empty file path".to_string());
+    }
     Ok(full_path)
 }
 
-fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
-    let users_r = get_config_table().get("users");
-    let users = match users_r {
-        Some(users) => users,
-        None => {
-            debug_log!("No users section in config.toml, ignoring upload path restriction");
-            return Ok(());
-        }
+fn validate_users_config(config: &Table) -> Result<(), String> {
+    let Some(users) = config.get("users") else {
+        return Ok(());
     };
-    let users_vec = users.as_array().unwrap();
-    for user in users_vec {
-        let user_name = user.get("name").unwrap().as_str().unwrap();
-        let user_prefixes = user.get("prefixes").unwrap();
-        let user_prefixes_vec = user_prefixes.as_array().unwrap();
-        for prefix_value in user_prefixes_vec {
-            let prefix = prefix_value.as_str().unwrap();
-            if (path.starts_with(prefix) || prefix.is_empty()) && user_name == owner {
+    let users = users
+        .as_array()
+        .ok_or("users must be an array of tables ([[users]])")?;
+    for user in users {
+        user.get("name")
+            .and_then(|v| v.as_str())
+            .ok_or("each user must have a string name")?;
+        let prefixes = user
+            .get("prefixes")
+            .and_then(|v| v.as_array())
+            .ok_or("each user must have a prefixes array")?;
+        for prefix in prefixes {
+            normalize_storage_path(prefix.as_str().ok_or("prefixes must contain strings")?)?;
+        }
+    }
+    Ok(())
+}
+
+fn upload_permissions(config: &Table, owner: &str, path: &str) -> Result<(), String> {
+    validate_users_config(config)?;
+    let path = normalize_storage_path(path)?;
+    let Some(users) = config.get("users") else {
+        return Ok(());
+    };
+    for user in users.as_array().unwrap() {
+        if user.get("name").and_then(|v| v.as_str()) != Some(owner) {
+            continue;
+        }
+        for prefix in user.get("prefixes").and_then(|v| v.as_array()).unwrap() {
+            let prefix = normalize_storage_path(prefix.as_str().unwrap())?;
+            if prefix.is_empty() || PathBuf::from(&path).starts_with(&prefix) {
                 return Ok(());
             }
         }
     }
     Err(format!(
-        "User {} has no upload permissions for path {}",
-        owner, path
+        "User {owner} has no upload permissions for path {path}"
     ))
+}
+
+fn verify_upload_permissions(owner: &str, path: &str) -> Result<(), String> {
+    upload_permissions(get_config_table(), owner, path)
 }
 
 fn archive_parallelism() -> usize {
@@ -986,7 +1032,7 @@ fn unpack_archive_to_tempdir(
         .map_err(|e| format!("Failed to open archived upload: {}", e))?;
     let reader = archive_reader(archive_file, &archive_filename)?;
     let mut archive = tar::Archive::new(reader);
-    let temp_dir = tempfile::tempdir()
+    let temp_dir = tempfile::tempdir_in("download")
         .map_err(|e| format!("Failed to create archive extraction directory: {}", e))?;
     let mut entries = Vec::new();
     let mut unpacked_bytes = 0u64;
@@ -1079,12 +1125,13 @@ async fn spool_archive_field(
 ) -> Result<(tempfile::NamedTempFile, u64), String> {
     use tokio::io::AsyncReadExt;
 
-    let tmp = tempfile::NamedTempFile::new()
+    let tmp = tempfile::NamedTempFile::new_in("download")
         .map_err(|e| format!("Failed to create archive temp file: {}", e))?;
-    let tmp_path = tmp.path().to_path_buf();
-    let mut output = tokio::fs::File::create(&tmp_path)
-        .await
-        .map_err(|e| format!("Failed to open archive temp file: {}", e))?;
+    let mut output = tokio::fs::File::from_std(
+        tmp.as_file()
+            .try_clone()
+            .map_err(|e| format!("Failed to open archive temp file: {}", e))?,
+    );
     let mut field_stream = FieldStream::new(field);
     let mut total_size = 0u64;
     let mut buf = vec![0u8; 64 * 1024];
@@ -1230,8 +1277,17 @@ async fn ax_post_archive(
         if name == "path" {
             match field.bytes().await {
                 Ok(data) => {
-                    path = String::from_utf8(data.to_vec())
-                        .unwrap_or_else(|_| String::from_utf8_lossy(&data).to_string());
+                    path = match String::from_utf8(data.to_vec()) {
+                        Ok(path) => path,
+                        Err(_) => {
+                            return archive_error_response(
+                                StatusCode::BAD_REQUEST,
+                                path,
+                                "Path must be UTF-8".to_string(),
+                            )
+                            .into_response()
+                        }
+                    };
                 }
                 Err(e) => {
                     return archive_error_response(
@@ -1288,6 +1344,10 @@ async fn ax_post_archive(
         }
     };
 
+    path = match storage_key(&path) {
+        Ok(path) => path,
+        Err(e) => return archive_error_response(StatusCode::BAD_REQUEST, path, e).into_response(),
+    };
     if let Err(e) = verify_upload_permissions(&owner, &path) {
         return archive_error_response(StatusCode::FORBIDDEN, path, e).into_response();
     }
@@ -1405,6 +1465,18 @@ async fn ax_post_file(
         Ok(owner) => owner,
         Err(_) => return (StatusCode::UNAUTHORIZED, Vec::new()),
     };
+    let hdr_content_type = match headers.get("Content-Type-Upstream") {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_string()),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    b"Invalid Content-Type-Upstream".to_vec(),
+                )
+            }
+        },
+        None => None,
+    };
     debug_log!("Authorized");
 
     /* 100-continue Expect is broken, quite hard to fix in axum */
@@ -1444,7 +1516,10 @@ async fn ax_post_file(
             let data = field.bytes().await;
             match data {
                 Ok(data) => {
-                    path = String::from_utf8(data.to_vec()).unwrap();
+                    path = match String::from_utf8(data.to_vec()) {
+                        Ok(path) => path,
+                        Err(_) => return (StatusCode::BAD_REQUEST, b"Path must be UTF-8".to_vec()),
+                    };
                     debug_log!("Field {}: path = {}", name, path);
                 }
                 Err(e) => {
@@ -1460,7 +1535,7 @@ async fn ax_post_file(
                     if path.is_empty() {
                         // BUFFERED PATH: file0 arrived before path, buffer to temp file
                         debug_log!("file0 arrived before path, buffering to temp file");
-                        let tmp = match tempfile::NamedTempFile::new() {
+                        let tmp = match tempfile::NamedTempFile::new_in("download") {
                             Ok(f) => f,
                             Err(e) => {
                                 eprintln!("Failed to create temp file: {:?}", e);
@@ -1471,9 +1546,8 @@ async fn ax_post_file(
                                 break;
                             }
                         };
-                        let tmp_path = tmp.path().to_path_buf();
-                        let mut async_file = match tokio::fs::File::create(&tmp_path).await {
-                            Ok(f) => f,
+                        let mut async_file = match tmp.as_file().try_clone() {
+                            Ok(f) => tokio::fs::File::from_std(f),
                             Err(e) => {
                                 eprintln!("Failed to open temp file for writing: {:?}", e);
                                 upload_result = Some((
@@ -1535,7 +1609,7 @@ async fn ax_post_file(
                     };
 
                     // verify upload permissions
-                    match verify_upload_permissions(&owner, &path) {
+                    match verify_upload_permissions(&owner, &full_path) {
                         Ok(_) => (),
                         Err(e) => {
                             upload_result =
@@ -1544,7 +1618,6 @@ async fn ax_post_file(
                         }
                     }
 
-                    let hdr_content_type = headers.get("Content-Type-Upstream");
                     let semaphore = get_or_create_semaphore(&state.file_locks, &full_path);
                     locked_path = Some(full_path.clone());
 
@@ -1572,8 +1645,8 @@ async fn ax_post_file(
                         }
                     };
 
-                    let content_type: String = match hdr_content_type {
-                        Some(content_type) => content_type.to_str().unwrap().to_string(),
+                    let content_type: String = match &hdr_content_type {
+                        Some(content_type) => content_type.clone(),
                         None => {
                             let heuristic_ctype = heuristic_filetype(file0_filename.clone());
                             debug_log!(
@@ -1599,7 +1672,10 @@ async fn ax_post_file(
                         .await;
 
                     if result.is_empty() {
-                        upload_result = Some((StatusCode::CONFLICT, Vec::new()));
+                        upload_result = Some((
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Backend write failed".to_vec(),
+                        ));
                         break;
                     }
 
@@ -1657,28 +1733,36 @@ async fn ax_post_file(
                 }
             };
 
-            match verify_upload_permissions(&owner, &path) {
+            match verify_upload_permissions(&owner, &full_path) {
                 Ok(_) => (),
                 Err(e) => {
                     return (StatusCode::FORBIDDEN, e.to_string().into_bytes());
                 }
             }
 
-            let hdr_content_type = headers.get("Content-Type-Upstream");
             let semaphore = get_or_create_semaphore(&state.file_locks, &full_path);
 
-            let _permit = match semaphore.try_acquire() {
-                Ok(permit) => permit,
-                Err(_) => {
-                    return (
-                        StatusCode::CONFLICT,
-                        "Upload already in progress".to_string().into_bytes(),
-                    );
-                }
-            };
+            let _permit =
+                match tokio::time::timeout(std::time::Duration::from_secs(30), semaphore.acquire())
+                    .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            b"Semaphore closed".to_vec(),
+                        )
+                    }
+                    Err(_) => {
+                        return (
+                            StatusCode::CONFLICT,
+                            "Timeout waiting for upload".to_string().into_bytes(),
+                        );
+                    }
+                };
 
-            let content_type: String = match hdr_content_type {
-                Some(content_type) => content_type.to_str().unwrap().to_string(),
+            let content_type: String = match &hdr_content_type {
+                Some(content_type) => content_type.clone(),
                 None => {
                     let heuristic_ctype = heuristic_filetype(file0_filename.clone());
                     debug_log!(
@@ -1718,7 +1802,10 @@ async fn ax_post_file(
             cleanup_semaphore(&state.file_locks, &full_path);
 
             if result.is_empty() {
-                return (StatusCode::CONFLICT, Vec::new());
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    b"Backend write failed".to_vec(),
+                );
             }
 
             let status = StatusCode::OK;
@@ -1804,14 +1891,15 @@ async fn ax_get_file(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let fallback_rate = match download_challenge::authorize_request(
-        &rxheaders,
-        remote_addr,
-        &original_uri,
-    ) {
-        Ok(rate) => rate,
-        Err(response) => return response,
+    let filepath = match storage_key(&filepath) {
+        Ok(path) => path,
+        Err(_) => return (StatusCode::NOT_FOUND, "Not Found").into_response(),
     };
+    let fallback_rate =
+        match download_challenge::authorize_request(&rxheaders, remote_addr, &original_uri) {
+            Ok(rate) => rate,
+            Err(response) => return response,
+        };
 
     let timestamp = std::time::SystemTime::now();
     let user_agent_str = rxheaders
@@ -1975,16 +2063,14 @@ async fn ax_get_file(
         }
     };
 
-    // Range. `parse_range` reports an unspecified/invalid end as 0, which is
-    // how an open-ended "bytes=100-" arrives here; `last` is the inclusive
-    // final byte actually served.
     let mut start = 0u64;
     let mut explicit_end = None;
+    let is_range = rxheaders.contains_key("Range");
     if let Some(range) = rxheaders.get("Range") {
         match range.to_str().ok().and_then(parse_range) {
             Some((parsed_start, parsed_end)) => {
                 start = parsed_start;
-                explicit_end = (parsed_end != 0).then_some(parsed_end);
+                explicit_end = parsed_end;
             }
             None => {
                 return (StatusCode::RANGE_NOT_SATISFIABLE, "Malformed Range header")
@@ -1992,7 +2078,6 @@ async fn ax_get_file(
             }
         }
     }
-    let is_range = start != 0 || explicit_end.is_some();
     if is_range && start >= file_size {
         headers.insert(
             header::CONTENT_RANGE,
@@ -2093,11 +2178,18 @@ async fn write_file_driver(
 
 /// Parse range header
 /// We support limited range only for now
-fn parse_range(range: &str) -> Option<(u64, u64)> {
-    let (_, range_spec) = range.split_once('=')?;
+fn parse_range(range: &str) -> Option<(u64, Option<u64>)> {
+    let range_spec = range.strip_prefix("bytes=")?;
     let (start_str, end_str) = range_spec.split_once('-')?;
     let start = start_str.parse::<u64>().ok()?;
-    let end = end_str.parse::<u64>().unwrap_or(0);
+    let end = if end_str.is_empty() {
+        None
+    } else {
+        Some(end_str.parse::<u64>().ok()?)
+    };
+    if end.is_some_and(|end| end < start) {
+        return None;
+    }
     Some((start, end))
 }
 
@@ -2205,5 +2297,63 @@ mod tests {
         assert!(other_request.archive_uploads.try_acquire().is_ok());
 
         drop(second);
+    }
+}
+
+#[cfg(test)]
+mod logic_tests {
+    use super::*;
+
+    #[test]
+    fn permissions_match_normalized_components() {
+        let config: Table = toml::from_str(
+            r#"[[users]]
+name="alice"
+prefixes=["/restricted-area/"]
+"#,
+        )
+        .unwrap();
+        for path in [
+            "restricted-area",
+            "/restricted-area/file",
+            "restricted-area//./file",
+        ] {
+            assert!(upload_permissions(&config, "alice", path).is_ok());
+        }
+        for path in ["restricted-area-other/file", "restricted-area/../other"] {
+            assert!(upload_permissions(&config, "alice", path).is_err());
+        }
+        assert!(upload_permissions(&config, "bob", "restricted-area/file").is_err());
+        let config: Table = toml::from_str("[users.alice]\nprefixes=[]").unwrap();
+        assert!(validate_users_config(&config).is_err());
+        let config: Table = toml::from_str("[[users]]\nname='alice'\nprefixes=[1]").unwrap();
+        assert!(validate_users_config(&config).is_err());
+    }
+
+    #[test]
+    fn lock_entries_are_removed_after_last_user_even_on_early_exit() {
+        let locks = Arc::new(StdMutex::new(HashMap::new()));
+        let first = get_or_create_semaphore(&locks, "file");
+        let second = get_or_create_semaphore(&locks, "file");
+        assert_eq!(locks.lock().unwrap().len(), 1);
+        drop(first);
+        assert_eq!(locks.lock().unwrap().len(), 1);
+        drop(second);
+        assert!(locks.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ranges_preserve_zero_ends_and_reject_invalid_bounds() {
+        assert_eq!(parse_range("bytes=0-0"), Some((0, Some(0))));
+        assert_eq!(parse_range("bytes=0-"), Some((0, None)));
+        for input in [
+            "items=1-5",
+            "bytes=10-5",
+            "bytes=0-invalid",
+            "bytes=0-1,4-5",
+            "bytes=-5",
+        ] {
+            assert_eq!(parse_range(input), None);
+        }
     }
 }

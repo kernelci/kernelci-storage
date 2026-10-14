@@ -1,15 +1,16 @@
 use crate::{
-    get_config_content,
+    get_config_table,
     logging::{format_log_timestamp, logfmt_string},
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use toml::value::Table;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
     email: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    exp: Option<u64>,
 }
 
 fn verify_with_key_str(
@@ -19,7 +20,8 @@ fn verify_with_key_str(
     let key = DecodingKey::from_secret(key_str.as_bytes());
     let mut validation = Validation::default();
     validation.required_spec_claims.clear();
-    validation.validate_exp = false;
+    validation.validate_exp = true;
+    validation.leeway = 0;
     validation.validate_aud = false;
     let token_data = decode::<Claims>(token_str, &key, &validation)?;
     let mut claims = BTreeMap::new();
@@ -50,8 +52,7 @@ pub fn verify_jwt_token(
     token_str: &str,
     client_info: &str,
 ) -> Result<BTreeMap<String, String>, jsonwebtoken::errors::Error> {
-    let toml_cfg = get_config_content();
-    let parsed_toml = toml_cfg.parse::<Table>().unwrap();
+    let parsed_toml = get_config_table();
 
     // If only unified_secret is configured, it serves as jwt_secret as well.
     // Try jwt_secret first, then fall through to unified_secret.
@@ -109,8 +110,7 @@ pub fn generate_jwt_secret() {
 }
 
 pub fn generate_jwt_token(email: &str) -> Result<String, jsonwebtoken::errors::Error> {
-    let toml_cfg = get_config_content();
-    let parsed_toml = toml_cfg.parse::<Table>().unwrap();
+    let parsed_toml = get_config_table();
     // For token generation, prefer jwt_secret, fall back to unified_secret
     let key_str = parsed_toml
         .get("jwt_secret")
@@ -120,6 +120,60 @@ pub fn generate_jwt_token(email: &str) -> Result<String, jsonwebtoken::errors::E
     let key = EncodingKey::from_secret(key_str.as_bytes());
     let claims = Claims {
         email: email.to_string(),
+        exp: Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .saturating_add(86400),
+        ),
     };
     encode(&Header::default(), &claims, &key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supplied_expiration_is_checked_and_legacy_tokens_still_work() {
+        let key = EncodingKey::from_secret(b"test-key");
+        let legacy = encode(
+            &Header::default(),
+            &Claims {
+                email: "alice".to_string(),
+                exp: None,
+            },
+            &key,
+        )
+        .unwrap();
+        assert!(verify_with_key_str(&legacy, "test-key").is_ok());
+        let expired = encode(
+            &Header::default(),
+            &Claims {
+                email: "alice".to_string(),
+                exp: Some(1),
+            },
+            &key,
+        )
+        .unwrap();
+        assert!(verify_with_key_str(&expired, "test-key").is_err());
+        let future = encode(
+            &Header::default(),
+            &Claims {
+                email: "alice".to_string(),
+                exp: Some(u64::MAX),
+            },
+            &key,
+        )
+        .unwrap();
+        assert!(verify_with_key_str(&future, "test-key").is_ok());
+        let malformed = encode(
+            &Header::default(),
+            &serde_json::json!({"email":"alice", "exp":"invalid"}),
+            &key,
+        )
+        .unwrap();
+        assert!(verify_with_key_str(&malformed, "test-key").is_err());
+    }
 }
