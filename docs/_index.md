@@ -263,3 +263,16 @@ With the local backend, the tag is recorded as a `tag-retention:6m` line in the 
 
 - `STORAGE_DEBUG`: Enable debug logging
 - `KCI_STORAGE_CONFIG`: Override default config file path
+
+### Request handling notes
+
+Configure top-level `trusted_proxies` with the CIDRs of reverse proxies that
+supply forwarded client addresses. Select `trusted_proxy_header` as
+`x-forwarded-for` (the default) or `forwarded`, matching what the proxy appends
+or overwrites. The other header family is ignored. With no configured proxies, client addresses
+come from the connection. Forwarded chains are resolved from right to left.
+Upload prefix checks match whole directory components, and invalid `[[users]]`
+entries prevent startup. Buffered uploads and archive extraction use `download/`
+in the files directory. CLI-generated user tokens expire after 24 hours;
+existing tokens without an expiration claim remain accepted, while supplied
+expiration claims are checked.

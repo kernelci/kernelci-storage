@@ -1,6 +1,10 @@
 driver="local"
 jwt_secret="test-secret-for-local-storage-testing"
 
+# Optional reverse proxies whose forwarded client addresses should be used.
+#trusted_proxies = ["127.0.0.1/32"]
+#trusted_proxy_header = "x-forwarded-for" # or "forwarded"
+
 # Optional client IP subnets to reject. List multiple IPv4 or IPv6 CIDRs in
 # one TOML array. Use /32 (IPv4) or /128 (IPv6) to block a single address.
 #block_subnets = ["192.0.2.0/24", "198.51.100.0/24", "2001:db8::/32"]
