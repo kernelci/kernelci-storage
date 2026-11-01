@@ -2263,12 +2263,12 @@ fn verify_auth_hdr(headers: &HeaderMap, client_info: &str) -> Result<String, Opt
 
 async fn ax_list_files() -> (StatusCode, String) {
     let driver_name = get_driver_type();
-    // Listing files is disabled for Azure backend because it is too slow
-    // (flat blob namespace requires enumerating all blobs with prefix filtering).
-    if driver_name == "azure" {
+    // Listing files is disabled for object-store backends (Azure, S3) because
+    // it is too slow (a flat namespace requires enumerating every object).
+    if driver_name != "local" {
         return (
             StatusCode::FORBIDDEN,
-            "Listing files is disabled for Azure storage backend".to_string(),
+            format!("Listing files is disabled for {driver_name} storage backend"),
         );
     }
     let driver = driver();
