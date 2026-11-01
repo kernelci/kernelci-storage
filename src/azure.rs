@@ -11,6 +11,9 @@ impl AzureDriver {
 }
 
 use crate::objcache::{self, CACHE_DIR};
+use crate::objupload::{
+    read_first_chunk, read_full_chunk, sanitize_tag_component, upload_tag_pairs, UPLOAD_CHUNK_SIZE,
+};
 use crate::{debug_log, CacheState, ReceivedFile};
 use async_trait::async_trait;
 use azure_storage::StorageCredentials;
@@ -26,7 +29,6 @@ use std::io::Read;
 use std::io::Write;
 use std::sync::OnceLock;
 use tempfile::Builder;
-use tokio::io::AsyncReadExt;
 
 #[derive(Deserialize)]
 struct AzureConfig {
@@ -34,21 +36,6 @@ struct AzureConfig {
     key: String,
     container: String,
     sastoken: String,
-}
-
-// Sanitize Azure Blob Index tag key/value components.
-// Replace any non [A-Za-z0-9_.-] characters with '_'.
-fn sanitize_tag_component(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn normalize_sas_token(input: &str) -> String {
@@ -118,91 +105,6 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
-/// Whether upload tagging is enabled. Disabled by default (tagging costs an
-/// extra set_tags round-trip per upload and nothing here reads the tags back);
-/// enable via KCI_STORAGE_ENABLE_UPLOAD_TAGS=1/true/yes when a backend
-/// lifecycle rule needs the owner/retention index tags.
-fn upload_tags_enabled() -> bool {
-    std::env::var("KCI_STORAGE_ENABLE_UPLOAD_TAGS")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes"
-        })
-        .unwrap_or(false)
-}
-
-/// Build blob index tags for a new upload: owner (when known) plus the
-/// optional configured retention tag. An Azure lifecycle management rule
-/// matching the retention tag (blobIndexMatch) can then expire the blob.
-/// Returns None when there is nothing to tag.
-fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
-    // Tagging costs an extra set_tags round-trip per upload and is off by
-    // default; enable via KCI_STORAGE_ENABLE_UPLOAD_TAGS when a backend
-    // lifecycle rule consumes the owner/retention index tags.
-    if !upload_tags_enabled() {
-        return None;
-    }
-
-    let mut pairs: Vec<(String, String)> = Vec::new();
-
-    if let Some(email) = owner_email {
-        let sanitized = sanitize_tag_component(&email);
-        if sanitized != email {
-            debug_log!(
-                "Sanitized owner tag value from '{}' to '{}'",
-                email,
-                sanitized
-            );
-        }
-        // Ensure non-empty value
-        let final_value = if sanitized.is_empty() {
-            "_".to_string()
-        } else {
-            sanitized
-        };
-        pairs.push(("owner".to_string(), final_value));
-    }
-
-    if let Some((key, value)) = crate::get_retention_tag() {
-        let key = sanitize_tag_component(&key);
-        let value = sanitize_tag_component(&value);
-        if !key.is_empty() && !value.is_empty() {
-            pairs.push((key, value));
-        } else {
-            debug_log!("Retention tag is empty after sanitization, skipping");
-        }
-    }
-
-    if pairs.is_empty() {
-        return None;
-    }
-    let mut tags = Tags::new();
-    for (key, value) in pairs {
-        tags.insert(key, value);
-    }
-    Some(tags)
-}
-
-/// Read from the stream until the buffer is full or EOF is reached. A single
-/// read() may return far less than the buffer size (e.g. one multipart
-/// network chunk), which would otherwise turn every ~64KB into its own
-/// put_block round-trip.
-async fn read_full_chunk(
-    data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    buf: &mut [u8],
-) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = data.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    Ok(filled)
-}
-
 /// Write file to Azure blob storage using streaming (new version)
 async fn write_file_to_blob_streaming(
     filename: String,
@@ -226,20 +128,10 @@ async fn upload_blob_stream(
     cont_type: String,
     tags: Option<Tags>,
 ) -> Result<usize, String> {
-    let chunk_size = 10 * 1024 * 1024;
-    let probe_size = 256 * 1024;
-    let mut buffer = vec![0u8; probe_size];
-    let mut chunk_len = read_full_chunk(data, &mut buffer)
-        .await
-        .map_err(|e| e.to_string())?;
-    if chunk_len == probe_size {
-        buffer.resize(chunk_size, 0);
-        chunk_len += read_full_chunk(data, &mut buffer[probe_size..])
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    let chunk_size = UPLOAD_CHUNK_SIZE;
+    let mut buffer = read_first_chunk(data).await.map_err(|e| e.to_string())?;
+    let mut chunk_len = buffer.len();
     if chunk_len < chunk_size {
-        buffer.truncate(chunk_len);
         let upload = blob_client.put_block_blob(buffer).content_type(cont_type);
         upload
             .await
@@ -297,6 +189,22 @@ fn blob_cache_paths(filename: &str) -> (std::path::PathBuf, std::path::PathBuf) 
 
 fn invalidate_cached_blob(filename: &str) -> Result<(), String> {
     objcache::invalidate(CACHE_DIR, &normalize_blob_key(filename))
+}
+
+/// Build blob index tags for a new upload (see `objupload::upload_tag_pairs`).
+/// An Azure lifecycle management rule matching the retention tag
+/// (blobIndexMatch) can then expire the blob. Returns None when there is
+/// nothing to tag.
+fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
+    let pairs = upload_tag_pairs(owner_email);
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut tags = Tags::new();
+    for (key, value) in pairs {
+        tags.insert(key, value);
+    }
+    Some(tags)
 }
 
 /// Write file to Azure blob storage (legacy version using Vec<u8>)
@@ -614,6 +522,7 @@ mod tests {
 #[cfg(test)]
 mod upload_cache_tests {
     use super::*;
+    use crate::objupload::FailedRead;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -679,17 +588,6 @@ mod upload_cache_tests {
         }
         assert_ne!(client("a//file"), client("a/file"));
         assert_ne!(blob_cache_paths("a//file"), blob_cache_paths("a/file"));
-    }
-
-    struct FailedRead;
-    impl tokio::io::AsyncRead for FailedRead {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            _: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Err(std::io::Error::other("injected read error")))
-        }
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ mod local;
 mod logging;
 mod monitor;
 mod objcache;
+mod objupload;
 mod storcaching;
 mod storjwt;
 mod subnet;
