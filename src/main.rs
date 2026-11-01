@@ -17,6 +17,7 @@ mod local;
 #[macro_use]
 mod logging;
 mod monitor;
+mod objcache;
 mod storcaching;
 mod storjwt;
 mod subnet;
