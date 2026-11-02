@@ -42,6 +42,19 @@ const RECOUNT_MAX_SLEEP: Duration = Duration::from_secs(5);
 #[cfg(test)]
 pub(crate) static COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Run an async test body while holding `COUNTER_TEST_LOCK`, for tests that
+/// publish or evict cache entries. A std mutex must not be held across an
+/// await, so the body runs on its own runtime inside the locked section.
+#[cfg(test)]
+pub(crate) fn block_on_with_counter_lock<F: std::future::Future>(future: F) -> F::Output {
+    let _counter_lock = COUNTER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
 static CACHED_FILES: AtomicUsize = AtomicUsize::new(0);
 
 /// Record that a new `.content` entry was published into the cache.

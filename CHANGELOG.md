@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- S3-compatible storage backend (`driver="s3"`, `[s3]` section) for AWS S3,
+  MinIO, Garage, Hetzner, Cloudflare R2 and others, built on `object_store`.
+  Downloads are served from the local cache like the Azure backend; uploads
+  use a single PUT below 10 MiB and an aborted-on-error multipart upload above.
+
+### Changed
+- The on-disk download cache and upload helpers moved out of the Azure driver
+  into shared `objcache`/`objupload` modules (no behaviour change).
+- `GET /v1/list` is now refused for every backend except `local`.
+
 ## [0.2.0] - 2025-10-23
 
 ### Added

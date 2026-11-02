@@ -10,9 +10,12 @@ impl AzureDriver {
     }
 }
 
+use crate::objcache::{self, CACHE_DIR};
+use crate::objupload::{
+    read_first_chunk, read_full_chunk, sanitize_tag_component, upload_tag_pairs, UPLOAD_CHUNK_SIZE,
+};
 use crate::{debug_log, CacheState, ReceivedFile};
 use async_trait::async_trait;
-use axum::http::{HeaderName, HeaderValue};
 use azure_storage::StorageCredentials;
 use azure_storage_blobs::container::operations::BlobItem;
 use azure_storage_blobs::prelude::{
@@ -20,16 +23,12 @@ use azure_storage_blobs::prelude::{
 };
 use chksum_hash_sha2_512 as sha2_512;
 use futures::stream::StreamExt;
-use headers::HeaderMap;
 use reqwest::Client;
 use serde::Deserialize;
-use std::fs::read_to_string;
-use std::fs::File;
 use std::io::Read;
 use std::io::Write;
 use std::sync::OnceLock;
 use tempfile::Builder;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Deserialize)]
 struct AzureConfig {
@@ -37,21 +36,6 @@ struct AzureConfig {
     key: String,
     container: String,
     sastoken: String,
-}
-
-// Sanitize Azure Blob Index tag key/value components.
-// Replace any non [A-Za-z0-9_.-] characters with '_'.
-fn sanitize_tag_component(input: &str) -> String {
-    input
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 fn normalize_sas_token(input: &str) -> String {
@@ -121,91 +105,6 @@ fn calculate_checksum(filename: &String, data: &[u8]) {
     debug_log!("File: {} Checksum: {}", filename, digest.to_hex_lowercase());
 }
 
-/// Whether upload tagging is enabled. Disabled by default (tagging costs an
-/// extra set_tags round-trip per upload and nothing here reads the tags back);
-/// enable via KCI_STORAGE_ENABLE_UPLOAD_TAGS=1/true/yes when a backend
-/// lifecycle rule needs the owner/retention index tags.
-fn upload_tags_enabled() -> bool {
-    std::env::var("KCI_STORAGE_ENABLE_UPLOAD_TAGS")
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes"
-        })
-        .unwrap_or(false)
-}
-
-/// Build blob index tags for a new upload: owner (when known) plus the
-/// optional configured retention tag. An Azure lifecycle management rule
-/// matching the retention tag (blobIndexMatch) can then expire the blob.
-/// Returns None when there is nothing to tag.
-fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
-    // Tagging costs an extra set_tags round-trip per upload and is off by
-    // default; enable via KCI_STORAGE_ENABLE_UPLOAD_TAGS when a backend
-    // lifecycle rule consumes the owner/retention index tags.
-    if !upload_tags_enabled() {
-        return None;
-    }
-
-    let mut pairs: Vec<(String, String)> = Vec::new();
-
-    if let Some(email) = owner_email {
-        let sanitized = sanitize_tag_component(&email);
-        if sanitized != email {
-            debug_log!(
-                "Sanitized owner tag value from '{}' to '{}'",
-                email,
-                sanitized
-            );
-        }
-        // Ensure non-empty value
-        let final_value = if sanitized.is_empty() {
-            "_".to_string()
-        } else {
-            sanitized
-        };
-        pairs.push(("owner".to_string(), final_value));
-    }
-
-    if let Some((key, value)) = crate::get_retention_tag() {
-        let key = sanitize_tag_component(&key);
-        let value = sanitize_tag_component(&value);
-        if !key.is_empty() && !value.is_empty() {
-            pairs.push((key, value));
-        } else {
-            debug_log!("Retention tag is empty after sanitization, skipping");
-        }
-    }
-
-    if pairs.is_empty() {
-        return None;
-    }
-    let mut tags = Tags::new();
-    for (key, value) in pairs {
-        tags.insert(key, value);
-    }
-    Some(tags)
-}
-
-/// Read from the stream until the buffer is full or EOF is reached. A single
-/// read() may return far less than the buffer size (e.g. one multipart
-/// network chunk), which would otherwise turn every ~64KB into its own
-/// put_block round-trip.
-async fn read_full_chunk(
-    data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
-    buf: &mut [u8],
-) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let n = data.read(&mut buf[filled..]).await?;
-        if n == 0 {
-            break;
-        }
-        filled += n;
-    }
-    Ok(filled)
-}
-
 /// Write file to Azure blob storage using streaming (new version)
 async fn write_file_to_blob_streaming(
     filename: String,
@@ -229,20 +128,10 @@ async fn upload_blob_stream(
     cont_type: String,
     tags: Option<Tags>,
 ) -> Result<usize, String> {
-    let chunk_size = 10 * 1024 * 1024;
-    let probe_size = 256 * 1024;
-    let mut buffer = vec![0u8; probe_size];
-    let mut chunk_len = read_full_chunk(data, &mut buffer)
-        .await
-        .map_err(|e| e.to_string())?;
-    if chunk_len == probe_size {
-        buffer.resize(chunk_size, 0);
-        chunk_len += read_full_chunk(data, &mut buffer[probe_size..])
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    let chunk_size = UPLOAD_CHUNK_SIZE;
+    let mut buffer = read_first_chunk(data).await.map_err(|e| e.to_string())?;
+    let mut chunk_len = buffer.len();
     if chunk_len < chunk_size {
-        buffer.truncate(chunk_len);
         let upload = blob_client.put_block_blob(buffer).content_type(cont_type);
         upload
             .await
@@ -293,30 +182,29 @@ pub(crate) fn normalize_blob_key(filename: &str) -> String {
         .join("/")
 }
 
+#[cfg(test)]
 fn blob_cache_paths(filename: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    let filename = normalize_blob_key(filename);
-    let hash = sha2_512::default().update(filename.as_bytes()).finalize();
-    crate::storcaching::cache_file_paths("cache", &hash.digest().to_hex_lowercase())
-}
-
-fn remove_cache_entry(content: &std::path::Path, headers: &std::path::Path) -> Result<(), String> {
-    for (path, is_content) in [(headers, false), (content, true)] {
-        match std::fs::remove_file(path) {
-            Ok(()) => {
-                if is_content {
-                    crate::storcaching::note_cache_file_removed();
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Failed to invalidate cache: {e}")),
-        }
-    }
-    Ok(())
+    objcache::cache_paths(CACHE_DIR, &normalize_blob_key(filename))
 }
 
 fn invalidate_cached_blob(filename: &str) -> Result<(), String> {
-    let (content, headers) = blob_cache_paths(filename);
-    remove_cache_entry(&content, &headers)
+    objcache::invalidate(CACHE_DIR, &normalize_blob_key(filename))
+}
+
+/// Build blob index tags for a new upload (see `objupload::upload_tag_pairs`).
+/// An Azure lifecycle management rule matching the retention tag
+/// (blobIndexMatch) can then expire the blob. Returns None when there is
+/// nothing to tag.
+fn upload_tags(owner_email: Option<String>) -> Option<Tags> {
+    let pairs = upload_tag_pairs(owner_email);
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut tags = Tags::new();
+    for (key, value) in pairs {
+        tags.insert(key, value);
+    }
+    Some(tags)
 }
 
 /// Write file to Azure blob storage (legacy version using Vec<u8>)
@@ -414,116 +302,12 @@ async fn write_file_to_blob(
     "OK"
 }
 
-/// Read a cached headers sidecar. Returns None when the file is not there yet
-/// (another request is still downloading) or cannot be read. Malformed lines
-/// are skipped rather than panicking a request handler.
-/// (Maybe should be moved to a separate module, its not Azure specific)
-fn read_headers_file(path: &str) -> Option<HeaderMap> {
-    let file_content = read_to_string(path).ok()?;
-    let mut headers = HeaderMap::new();
-    for line in file_content.lines() {
-        // Split only on the first ':' so values like times (HH:MM:SS) are preserved
-        if let Some((name, value)) = line.split_once(':') {
-            if let (Ok(key), Ok(value)) = (
-                HeaderName::from_bytes(name.trim().as_bytes()),
-                HeaderValue::from_str(value.trim()),
-            ) {
-                headers.insert(key, value);
-            }
-        }
-    }
-    Some(headers)
-}
-
-/// Save headers(Azure) to file. Blocking — call it from a blocking thread.
-/// Built in one buffer so the sidecar lands in a single write.
-fn save_headers_to_file(filename: &str, headers: &HeaderMap) {
-    let mut body = String::new();
-    for (key, value) in headers.iter() {
-        // TBD: Filter out some names?
-        let Ok(value) = value.to_str() else {
-            continue;
-        };
-        body.push_str(&key.as_str().to_lowercase());
-        body.push(':');
-        body.push_str(value);
-        body.push('\n');
-    }
-    match File::create(filename) {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(body.as_bytes()) {
-                eprintln!("Error writing headers file {}: {:?}", filename, e);
-            }
-        }
-        Err(e) => {
-            eprintln!("Error creating headers file {}: {:?}", filename, e);
-        }
-    }
-}
-
-/// Outcome of inspecting the on-disk cache entry for a blob.
-enum CacheProbe {
-    /// Content and headers are both present; the content file is already open.
-    Hit {
-        file: File,
-        size: u64,
-        headers: HeaderMap,
-    },
-    /// Nothing usable cached; fetch from the backend.
-    Miss,
-    /// A broken entry that could not be cleaned up; fail the request.
-    Broken,
-}
-
-/// Inspect (and, when stale, clean up) the cache entry for a blob.
-///
-/// Blocking — call it from a blocking thread. Everything the GET handler needs
-/// is collected here in one hop: the open content handle, its size taken from
-/// that same handle, and the parsed headers. Opening rather than stat-then-open
-/// also closes the window where cache eviction removes the file in between.
-fn probe_cache(content_path: &str, headers_path: &str) -> CacheProbe {
-    let file = match File::open(content_path) {
-        Ok(file) => file,
-        Err(_) => return CacheProbe::Miss,
-    };
-
-    let size = match file.metadata() {
-        Ok(metadata) => metadata.len(),
-        Err(e) => {
-            eprintln!("Error reading metadata of {}: {:?}", content_path, e);
-            return CacheProbe::Miss;
-        }
-    };
-
-    match read_headers_file(headers_path) {
-        Some(headers) => CacheProbe::Hit {
-            file,
-            size,
-            headers,
-        },
-        None => {
-            drop(file);
-            match remove_cache_entry(
-                std::path::Path::new(content_path),
-                std::path::Path::new(headers_path),
-            ) {
-                Ok(()) => CacheProbe::Miss,
-                Err(e) => {
-                    eprintln!("{e}");
-                    CacheProbe::Broken
-                }
-            }
-        }
-    }
-}
-
 /// Get file from Azure blob storage
 async fn get_file_from_blob(filename: String) -> ReceivedFile {
-    //println!("get_file_from_blob {}", filename);
     let storage_sastoken = azure_credentials().sastoken.as_str();
     let blob_client = azure_blob_client(filename.as_str());
     let blob_url_res = blob_client.url();
-    let mut received_file = ReceivedFile::not_found(filename.clone(), CacheState::Uncached);
+    let received_file = ReceivedFile::not_found(filename.clone(), CacheState::Uncached);
 
     let mut blob_url = match blob_url_res {
         Ok(url) => url.to_string(),
@@ -534,50 +318,18 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     };
     // append SAS token to blob URL
     blob_url.push_str(storage_sastoken);
-    // we generate a hash of the filename to use as cache filename, sharded by
-    // the first hex byte of the digest so no single directory grows unbounded
-    let (content_path, headers_path) = blob_cache_paths(&filename);
-    let cache_hex = content_path
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let cache_filename = content_path.to_string_lossy().into_owned();
-    let cache_filename_headers = headers_path.to_string_lossy().into_owned();
-    let content = cache_filename.clone();
-    let headers = cache_filename_headers.clone();
-    let probe = match tokio::task::spawn_blocking(move || probe_cache(&content, &headers)).await {
-        Ok(probe) => probe,
-        Err(e) => {
-            eprintln!("Cache probe task failed: {e}");
-            return received_file;
-        }
-    };
-    match probe {
-        CacheProbe::Hit {
-            file,
-            size,
-            headers,
-        } => {
-            received_file.cached_filename = cache_filename;
-            received_file.headers = headers;
-            received_file.valid = true;
-            received_file.cache_state = CacheState::Cached;
-            received_file.file = Some(file);
-            received_file.size = size;
-            return received_file;
-        }
-        CacheProbe::Broken => return received_file,
-        CacheProbe::Miss => {}
+    // The cache is keyed by the same normalized name BlobClient::url uses,
+    // so aliases of one blob share a cache entry.
+    let key = normalize_blob_key(&filename);
+    match objcache::lookup(CACHE_DIR, &filename, &key).await {
+        Ok(Some(hit)) => return hit,
+        Ok(None) => {}
+        Err(()) => return received_file,
     }
-    debug_log!(
-        "Downloading blob to cache file {} from {}",
-        cache_filename,
-        blob_url
-    );
+    debug_log!("Downloading blob {} from {}", filename, blob_url);
     let response = http_client().get(blob_url).send().await;
     match response {
-        Ok(mut response) => {
+        Ok(response) => {
             debug_log!("Azure response: {:?}", response);
             // is status anything else than 200?
             // TODO: Do we need to return headers as well or it is data leakage?
@@ -614,108 +366,26 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
                 );
                 return received_file;
             }
-            received_file.headers = response.headers().clone();
-            let resp_headers = response.headers().clone();
-            // ensure the shard subdirectory exists before writing into it
-            if let Err(e) = crate::storcaching::ensure_shard_dir("cache", &cache_hex) {
-                eprintln!("Error creating cache shard directory: {:?}", e);
-                return received_file;
-            }
-
-            // Stream the response to a temporary file with asynchronous I/O.
-            // Publishing it with an atomic rename prevents readers from seeing
-            // a partial cache entry if the transfer is interrupted.
-            let cache_temp_filename = format!("{}.{}.part", cache_filename, std::process::id());
-            let mut f = match tokio::fs::File::create(&cache_temp_filename).await {
-                Ok(file) => file,
-                Err(e) => {
-                    eprintln!(
-                        "Error creating temporary cache file {}: {:?}",
-                        cache_temp_filename, e
-                    );
-                    return received_file;
-                }
-            };
-
-            loop {
-                match response.chunk().await {
-                    Ok(Some(chunk)) => {
-                        if let Err(e) = f.write_all(&chunk).await {
-                            eprintln!(
-                                "Error writing temporary cache file {}: {:?}",
-                                cache_temp_filename, e
-                            );
-                            drop(f);
-                            let _ = tokio::fs::remove_file(&cache_temp_filename).await;
-                            return received_file;
-                        }
+            let headers = response.headers().clone();
+            // Stream the body chunk by chunk without needing reqwest's
+            // `stream` feature.
+            let body = Box::pin(futures::stream::unfold(
+                response,
+                |mut response| async move {
+                    match response.chunk().await {
+                        Ok(Some(chunk)) => Some((Ok(chunk), response)),
+                        Ok(None) => None,
+                        Err(e) => Some((Err(e), response)),
                     }
-                    Ok(None) => break,
-                    Err(e) => {
-                        eprintln!("Error streaming blob {}: {:?}", filename, e);
-                        drop(f);
-                        let _ = tokio::fs::remove_file(&cache_temp_filename).await;
-                        return received_file;
-                    }
-                }
-            }
-
-            if let Err(e) = f.flush().await {
-                eprintln!(
-                    "Error flushing temporary cache file {}: {:?}",
-                    cache_temp_filename, e
-                );
-                drop(f);
-                let _ = tokio::fs::remove_file(&cache_temp_filename).await;
-                return received_file;
-            }
-            drop(f);
-
-            if let Err(e) = tokio::fs::rename(&cache_temp_filename, &cache_filename).await {
-                eprintln!(
-                    "Error publishing cache file {} as {}: {:?}",
-                    cache_temp_filename, cache_filename, e
-                );
-                let _ = tokio::fs::remove_file(&cache_temp_filename).await;
-                return received_file;
-            }
-            // Keep the housekeeping counter current so it does not have to walk
-            // the cache to learn its size. Two racing downloads of the same
-            // object both count here; the periodic recount corrects that.
-            crate::storcaching::note_cache_file_added();
-
-            // Publish the headers sidecar and open the freshly cached content
-            // for the response in a single blocking hop.
-            let content = cache_filename.clone();
-            let headers_path = cache_filename_headers.clone();
-            let opened = tokio::task::spawn_blocking(move || {
-                save_headers_to_file(&headers_path, &resp_headers);
-                let file = File::open(&content).ok()?;
-                let size = file.metadata().ok()?.len();
-                Some((file, size))
-            })
-            .await;
-
-            match opened {
-                Ok(Some((file, size))) => {
-                    received_file.cached_filename = cache_filename;
-                    received_file.valid = true;
-                    received_file.file = Some(file);
-                    received_file.size = size;
-                }
-                Ok(None) => {
-                    eprintln!("Error opening freshly cached file {}", cache_filename);
-                }
-                Err(e) => {
-                    eprintln!("Cache publish task panicked: {}", e);
-                }
-            }
+                },
+            ));
+            objcache::store(CACHE_DIR, &filename, &key, headers, body).await
         }
         Err(e) => {
             eprintln!("Error getting blob: {:?}", e);
+            received_file
         }
     }
-    received_file
 }
 
 // Implement set tags for Azure blob storage
@@ -852,6 +522,7 @@ mod tests {
 #[cfg(test)]
 mod upload_cache_tests {
     use super::*;
+    use crate::objupload::FailedRead;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -919,17 +590,6 @@ mod upload_cache_tests {
         assert_ne!(blob_cache_paths("a//file"), blob_cache_paths("a/file"));
     }
 
-    struct FailedRead;
-    impl tokio::io::AsyncRead for FailedRead {
-        fn poll_read(
-            self: std::pin::Pin<&mut Self>,
-            _: &mut std::task::Context<'_>,
-            _: &mut tokio::io::ReadBuf<'_>,
-        ) -> std::task::Poll<std::io::Result<()>> {
-            std::task::Poll::Ready(Err(std::io::Error::other("injected read error")))
-        }
-    }
-
     #[tokio::test]
     async fn upload_failures_do_not_commit_partial_streams_or_report_success() {
         let chunk = 10 * 1024 * 1024;
@@ -995,30 +655,5 @@ mod upload_cache_tests {
             assert_eq!(count.load(Ordering::SeqCst), expected_requests);
             server.abort();
         }
-    }
-
-    #[test]
-    fn empty_objects_are_cache_hits_and_orphans_are_removed_without_waiting() {
-        let _counter_lock = crate::storcaching::COUNTER_TEST_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let content = dir.path().join("entry.content");
-        let headers = dir.path().join("entry.headers");
-        std::fs::write(&content, "").unwrap();
-        std::fs::write(&headers, "content-type:application/octet-stream\n").unwrap();
-        assert!(matches!(
-            probe_cache(content.to_str().unwrap(), headers.to_str().unwrap()),
-            CacheProbe::Hit { size: 0, .. }
-        ));
-        std::fs::remove_file(&headers).unwrap();
-        std::fs::write(&content, "orphan").unwrap();
-        assert!(matches!(
-            probe_cache(content.to_str().unwrap(), headers.to_str().unwrap()),
-            CacheProbe::Miss
-        ));
-        assert!(!content.exists());
-        std::fs::write(&content, "cached-old-version").unwrap();
-        std::fs::write(&headers, "old-headers").unwrap();
-        remove_cache_entry(&content, &headers).unwrap();
-        assert!(!content.exists() && !headers.exists());
     }
 }

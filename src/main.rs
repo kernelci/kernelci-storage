@@ -5,7 +5,7 @@
    KernelCI Storage Server
 
    This is a simple storage server that supports file upload and download, with token based authentication.
-   It supports multiple backends, currently only Azure Blob is supported, to provide user transparent storage.
+   It supports multiple backends (Azure Blob, S3-compatible object storage and local filesystem) to provide user transparent storage.
    It caches the files in a local directory and serves them from there.
    Range requests are supported, but only for start offset, end limit is not implemented yet.
 */
@@ -17,6 +17,9 @@ mod local;
 #[macro_use]
 mod logging;
 mod monitor;
+mod objcache;
+mod objupload;
+mod s3;
 mod storcaching;
 mod storjwt;
 mod subnet;
@@ -352,6 +355,7 @@ fn init_driver(driver_type: &str) -> Box<dyn Driver> {
     let driver: Box<dyn Driver> = match driver_type {
         "azure" => Box::new(azure::AzureDriver::new()),
         "local" => Box::new(local::LocalDriver::new()),
+        "s3" => Box::new(s3::S3Driver::new()),
         //"google" => Box::new(google::GoogleDriver::new()),
         _ => {
             eprintln!("Unknown driver type: {}", driver_type);
@@ -857,10 +861,9 @@ fn normalize_storage_path(path: &str) -> Result<String, String> {
 fn storage_key(path: &str) -> Result<String, String> {
     validate_path(path)?;
     // Keep lock/cache keys consistent with the backend's effective object key.
-    if get_driver_type() == "local" {
-        normalize_storage_path(path)
-    } else {
-        Ok(azure::normalize_blob_key(path))
+    match get_driver_type() {
+        "local" | "s3" => normalize_storage_path(path),
+        _ => Ok(azure::normalize_blob_key(path)),
     }
 }
 
@@ -2261,12 +2264,12 @@ fn verify_auth_hdr(headers: &HeaderMap, client_info: &str) -> Result<String, Opt
 
 async fn ax_list_files() -> (StatusCode, String) {
     let driver_name = get_driver_type();
-    // Listing files is disabled for Azure backend because it is too slow
-    // (flat blob namespace requires enumerating all blobs with prefix filtering).
-    if driver_name == "azure" {
+    // Listing files is disabled for object-store backends (Azure, S3) because
+    // it is too slow (a flat namespace requires enumerating every object).
+    if driver_name != "local" {
         return (
             StatusCode::FORBIDDEN,
-            "Listing files is disabled for Azure storage backend".to_string(),
+            format!("Listing files is disabled for {driver_name} storage backend"),
         );
     }
     let driver = driver();

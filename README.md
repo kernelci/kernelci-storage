@@ -1,7 +1,7 @@
 # KernelCI Storage Server
 
 This is a simple storage server that supports file upload and download, with token based authentication.
-It supports multiple backends: Azure Blob Storage and local filesystem, to provide user transparent storage.
+It supports multiple backends: Azure Blob Storage, S3-compatible object storage and local filesystem, to provide user transparent storage.
 It caches the files in a local directory and serves them from there.
 Single byte ranges support start offsets and optional end limits.
 Files are protected by upload locking to prevent concurrent uploads to the same path.
@@ -41,6 +41,53 @@ storage_path="./storage"  # Optional, defaults to "./storage"
 name = "user@email.com"
 prefixes = ["/allowed/path"]
 ```
+
+### S3 Backend Configuration
+
+Works with AWS S3 and S3-compatible stores (MinIO, Garage, Hetzner Object
+Storage, Cloudflare R2, ...). Like the Azure backend, objects are fetched once
+into the local cache and served from there, so the cache still needs disk.
+
+```toml
+driver="s3"
+jwt_secret="JWT_SECRET"
+[s3]
+bucket="kernelci"              # required
+region="us-east-1"             # optional, defaults to "us-east-1" (Garage: "garage")
+endpoint="https://s3.example"  # optional; set for anything that is not AWS
+access_key_id="..."            # optional, together with secret_access_key
+secret_access_key="..."
+virtual_hosted_style=false     # optional, defaults to path-style requests
+allow_http=false               # optional, allow a plain-HTTP endpoint
+prefix=""                      # optional key prefix inside the bucket
+```
+
+Settings left out of `[s3]` fall back to the standard `AWS_*` environment
+variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+`AWS_REGION`, `AWS_ENDPOINT`, ...), which also covers IAM roles and IRSA.
+Values in the config file take precedence.
+
+Example for a local MinIO or Garage instance:
+
+```toml
+driver="s3"
+jwt_secret="JWT_SECRET"
+[s3]
+bucket="kernelci"
+region="garage"                    # MinIO accepts any region, e.g. "us-east-1"
+endpoint="http://127.0.0.1:3900"   # MinIO: http://127.0.0.1:9000
+allow_http=true
+access_key_id="GK..."
+secret_access_key="..."
+```
+
+Limitations:
+- `GET /v1/list` is disabled, as for Azure.
+- Tags can only be set when an object is uploaded. Owner and retention tags
+  (`[retention]`) are sent only when `KCI_STORAGE_ENABLE_UPLOAD_TAGS=1` is set.
+  Leave it off for stores without object tagging, such as Garage.
+- Objects uploaded to the bucket by other tools are served with the content
+  type they were stored with (`application/octet-stream` if none).
 
 ### Cache Housekeeping
 
