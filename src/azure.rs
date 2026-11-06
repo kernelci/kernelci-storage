@@ -537,11 +537,6 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     // we generate a hash of the filename to use as cache filename, sharded by
     // the first hex byte of the digest so no single directory grows unbounded
     let (content_path, headers_path) = blob_cache_paths(&filename);
-    let cache_hex = content_path
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
     let cache_filename = content_path.to_string_lossy().into_owned();
     let cache_filename_headers = headers_path.to_string_lossy().into_owned();
     let content = cache_filename.clone();
@@ -616,12 +611,6 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
             }
             received_file.headers = response.headers().clone();
             let resp_headers = response.headers().clone();
-            // ensure the shard subdirectory exists before writing into it
-            if let Err(e) = crate::storcaching::ensure_shard_dir("cache", &cache_hex) {
-                eprintln!("Error creating cache shard directory: {:?}", e);
-                return received_file;
-            }
-
             // Stream the response to a temporary file with asynchronous I/O.
             // Publishing it with an atomic rename prevents readers from seeing
             // a partial cache entry if the transfer is interrupted.
