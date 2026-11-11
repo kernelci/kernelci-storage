@@ -207,18 +207,10 @@ where
 {
     let mut received_file = ReceivedFile::not_found(filename.to_string(), CacheState::Uncached);
     let (content_path, headers_path) = cache_paths(cache_dir, key);
-    let cache_hex = content_path
-        .file_stem()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
     let cache_filename = content_path.to_string_lossy().into_owned();
     debug_log!("Downloading {} to cache file {}", filename, cache_filename);
-    // ensure the shard subdirectory exists before writing into it
-    if let Err(e) = crate::storcaching::ensure_shard_dir(cache_dir, &cache_hex) {
-        eprintln!("Error creating cache shard directory: {:?}", e);
-        return received_file;
-    }
+    // Shards are prepared at startup; creating directories here can block
+    // request workers behind cache-directory scans.
 
     // Stream the body to a temporary file with asynchronous I/O. Publishing
     // it with an atomic rename prevents readers from seeing a partial cache
@@ -340,6 +332,7 @@ mod tests {
     async fn store_then_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
+        crate::storcaching::prepare_cache_layout(root).unwrap();
         assert!(matches!(lookup(root, "a/b", "a/b").await, Ok(None)));
 
         let mut headers = HeaderMap::new();
@@ -372,6 +365,20 @@ mod tests {
     }
 
     #[test]
+    fn store_does_not_create_missing_shards() {
+        crate::storcaching::block_on_with_counter_lock(async {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().to_str().unwrap();
+            let body = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                b"content",
+            ))]);
+            let stored = store(root, "k", "k", HeaderMap::new(), body).await;
+            assert!(!stored.valid);
+            assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+        });
+    }
+
+    #[test]
     fn failed_body_stream_leaves_no_entry() {
         crate::storcaching::block_on_with_counter_lock(failed_body_stream());
     }
@@ -379,6 +386,7 @@ mod tests {
     async fn failed_body_stream() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_str().unwrap();
+        crate::storcaching::prepare_cache_layout(root).unwrap();
         let body = futures::stream::iter(vec![
             Ok(Bytes::from_static(b"partial")),
             Err(std::io::Error::other("injected")),

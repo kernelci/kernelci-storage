@@ -559,19 +559,14 @@ async fn initial_setup() -> Option<RustlsConfig> {
         std::process::exit(1);
     }
 
-    if !std::path::Path::new(cache_dir).exists() {
-        std::fs::create_dir(cache_dir).unwrap();
-    }
-
-    // Migrate any legacy flat cache layout into the sharded layout before the
-    // maintenance tasks and request handlers start touching the cache.
+    // Prepare every shard and migrate legacy files before maintenance and
+    // requests start. A cache miss must never create directories on a worker.
     {
         let cache_dir = cache_dir.to_string();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || storcaching::migrate_cache_layout(&cache_dir)).await
-        {
-            eprintln!("Cache migration task failed: {}", e);
-        }
+        tokio::task::spawn_blocking(move || storcaching::prepare_cache_layout(&cache_dir))
+            .await
+            .expect("Cache initialization task failed")
+            .expect("Failed to prepare cache shards");
     }
 
     storcaching::validate_cache(cache_dir.to_string()).await;

@@ -94,9 +94,20 @@ pub fn cache_file_paths(cache_dir: &str, hex: &str) -> (PathBuf, PathBuf) {
     )
 }
 
-/// Ensure the shard subdirectory for a cache key exists before writing into it.
-pub fn ensure_shard_dir(cache_dir: &str, hex: &str) -> std::io::Result<()> {
-    fs::create_dir_all(Path::new(cache_dir).join(shard_name(hex)))
+/// Prepare every cache shard before maintenance tasks and request handlers run.
+///
+/// Even when a shard already exists, `create_dir_all` first tries `mkdir`, which
+/// needs an exclusive lock on the parent directory. A slow cache-directory scan
+/// can hold up that lock long enough to block every async request worker if
+/// shard creation happens on cache misses. Keep it entirely in startup's
+/// blocking task instead.
+pub fn prepare_cache_layout(cache_dir: &str) -> std::io::Result<()> {
+    fs::create_dir_all(cache_dir)?;
+    for prefix in 0..=u8::MAX {
+        fs::create_dir_all(Path::new(cache_dir).join(format!("{prefix:02x}")))?;
+    }
+    migrate_cache_layout(cache_dir);
+    Ok(())
 }
 
 /// Visit every file path in the cache: shard subdirectories (one level deep)
@@ -799,6 +810,49 @@ mod tests {
             fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, b"x").unwrap();
+    }
+
+    #[test]
+    fn startup_prepares_all_shards_and_preserves_cached_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        let cache_dir = root.to_str().unwrap();
+
+        // A fresh cache is ready for any hash before the first request.
+        prepare_cache_layout(cache_dir).unwrap();
+        for prefix in 0..=u8::MAX {
+            assert!(root.join(format!("{prefix:02x}")).is_dir());
+        }
+
+        let (content, headers) = cache_file_paths(cache_dir, "abcd");
+        fs::write(&content, b"cached content").unwrap();
+        fs::write(&headers, b"cached headers").unwrap();
+        fs::write(root.join("0123.content"), b"legacy content").unwrap();
+        fs::write(root.join("0123.headers"), b"legacy headers").unwrap();
+
+        // Restarting also migrates a legacy pair without losing either pair.
+        prepare_cache_layout(cache_dir).unwrap();
+        assert_eq!(fs::read(&content).unwrap(), b"cached content");
+        assert_eq!(fs::read(&headers).unwrap(), b"cached headers");
+        let (legacy_content, legacy_headers) = cache_file_paths(cache_dir, "0123");
+        assert_eq!(fs::read(&legacy_content).unwrap(), b"legacy content");
+        assert_eq!(fs::read(&legacy_headers).unwrap(), b"legacy headers");
+        assert!(!root.join("0123.content").exists());
+        assert!(!root.join("0123.headers").exists());
+
+        prepare_cache_layout(cache_dir).unwrap();
+        assert_eq!(fs::read(&legacy_content).unwrap(), b"legacy content");
+        assert_eq!(fs::read(&legacy_headers).unwrap(), b"legacy headers");
+    }
+
+    #[test]
+    fn startup_rejects_a_shard_that_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("00");
+        fs::write(&shard, b"not a directory").unwrap();
+
+        assert!(prepare_cache_layout(dir.path().to_str().unwrap()).is_err());
+        assert_eq!(fs::read(shard).unwrap(), b"not a directory");
     }
 
     /// The whole module shares one process-wide counter, so this stays a single

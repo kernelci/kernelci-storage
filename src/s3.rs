@@ -409,6 +409,7 @@ mod tests {
     use object_store::memory::InMemory;
 
     fn backend(cache: &tempfile::TempDir, prefix: &str) -> S3Backend {
+        crate::storcaching::prepare_cache_layout(cache.path().to_str().unwrap()).unwrap();
         S3Backend {
             store: Box::new(InMemory::new()),
             prefix: prefix.to_string(),
@@ -540,7 +541,12 @@ mod tests {
             let backend = backend(&cache, "");
             let (received, _) = read_back(&backend, "no/such/file").await;
             assert!(!received.valid);
-            assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
+            assert!(std::fs::read_dir(cache.path())
+                .unwrap()
+                .all(|shard| std::fs::read_dir(shard.unwrap().path())
+                    .unwrap()
+                    .next()
+                    .is_none()));
         });
     }
 
