@@ -182,13 +182,20 @@ pub(crate) fn normalize_blob_key(filename: &str) -> String {
         .join("/")
 }
 
-#[cfg(test)]
-fn blob_cache_paths(filename: &str) -> (std::path::PathBuf, std::path::PathBuf) {
-    objcache::cache_paths(CACHE_DIR, &normalize_blob_key(filename))
+fn blob_cache_key(account: &str, container: &str, filename: &str) -> String {
+    objcache::scoped_key(
+        "azure",
+        &[account, container],
+        &normalize_blob_key(filename),
+    )
 }
 
 fn invalidate_cached_blob(filename: &str) -> Result<(), String> {
-    objcache::invalidate(CACHE_DIR, &normalize_blob_key(filename))
+    let config = azure_credentials();
+    objcache::invalidate(
+        CACHE_DIR,
+        &blob_cache_key(&config.account, &config.container, filename),
+    )
 }
 
 /// Build blob index tags for a new upload (see `objupload::upload_tag_pairs`).
@@ -320,7 +327,8 @@ async fn get_file_from_blob(filename: String) -> ReceivedFile {
     blob_url.push_str(storage_sastoken);
     // The cache is keyed by the same normalized name BlobClient::url uses,
     // so aliases of one blob share a cache entry.
-    let key = normalize_blob_key(&filename);
+    let config = azure_credentials();
+    let key = blob_cache_key(&config.account, &config.container, &filename);
     match objcache::lookup(CACHE_DIR, &filename, &key).await {
         Ok(Some(hit)) => return hit,
         Ok(None) => {}
@@ -576,6 +584,9 @@ mod upload_cache_tests {
 
     #[test]
     fn cache_identity_matches_azure_url_aliases() {
+        let blob_cache_paths = |key: &str| {
+            objcache::cache_paths(CACHE_DIR, &blob_cache_key("account", "container", key))
+        };
         let client = |key: &str| {
             ClientBuilder::emulator()
                 .blob_client("container", key)
@@ -588,6 +599,14 @@ mod upload_cache_tests {
         }
         assert_ne!(client("a//file"), client("a/file"));
         assert_ne!(blob_cache_paths("a//file"), blob_cache_paths("a/file"));
+        assert_ne!(
+            blob_cache_key("a", "c", "file"),
+            blob_cache_key("b", "c", "file")
+        );
+        assert_ne!(
+            blob_cache_key("a", "c", "file"),
+            blob_cache_key("a", "d", "file")
+        );
     }
 
     #[tokio::test]

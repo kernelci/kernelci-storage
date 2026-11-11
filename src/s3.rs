@@ -12,17 +12,18 @@ use async_trait::async_trait;
 use axum::http::HeaderValue;
 use bytes::Bytes;
 use headers::HeaderMap;
-use object_store::aws::AmazonS3Builder;
+use object_store::aws::{AmazonS3Builder, AmazonS3ConfigKey};
 use object_store::path::Path;
 use object_store::{
     Attribute, Attributes, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
     PutPayload, TagSet, WriteMultipart,
 };
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+use tokio::sync::mpsc;
 use toml::Table;
 
 /// Multipart parts uploaded concurrently per upload. Bounds the memory one
-/// upload holds to about this many `UPLOAD_CHUNK_SIZE` buffers.
+/// upload holds to this many chunks plus the bounded channel and reader buffers.
 const UPLOAD_PARALLEL_PARTS: usize = 4;
 
 pub struct S3Driver;
@@ -46,7 +47,7 @@ region="us-east-1"             # optional
 endpoint="https://s3.example"  # optional; for MinIO/Garage/Hetzner/R2
 access_key_id="..."            # optional; else AWS_ACCESS_KEY_ID etc.
 secret_access_key="..."
-virtual_hosted_style=false     # optional, path-style by default
+virtual_hosted_style=false     # optional; else environment, path-style by default
 allow_http=false               # optional, for a local MinIO/Garage
 prefix=""                      # optional key prefix inside the bucket
 */
@@ -113,7 +114,8 @@ fn parse_config(config: &Table) -> Result<S3Config, String> {
 /// A store plus where its objects live in it and where they are cached.
 /// Tests build one over `object_store::memory::InMemory`.
 struct S3Backend {
-    store: Box<dyn ObjectStore>,
+    store: Arc<dyn ObjectStore>,
+    cache_namespace: String,
     prefix: String,
     cache_dir: String,
 }
@@ -128,35 +130,62 @@ fn s3_backend() -> &'static S3Backend {
             eprintln!("Invalid s3 configuration: {error}");
             std::process::exit(1);
         });
-        let mut builder = AmazonS3Builder::from_env().with_bucket_name(&config.bucket);
-        if let Some(region) = &config.region {
-            builder = builder.with_region(region);
-        }
-        if let Some(endpoint) = &config.endpoint {
-            builder = builder.with_endpoint(endpoint);
-        }
-        if let (Some(key_id), Some(secret)) = (&config.access_key_id, &config.secret_access_key) {
-            builder = builder
-                .with_access_key_id(key_id)
-                .with_secret_access_key(secret);
-        }
-        // Path-style unless asked otherwise: it works with every
-        // S3-compatible store, virtual-hosted style needs per-bucket DNS.
-        builder =
-            builder.with_virtual_hosted_style_request(config.virtual_hosted_style.unwrap_or(false));
-        if let Some(allow_http) = config.allow_http {
-            builder = builder.with_allow_http(allow_http);
-        }
+        let builder = configure_builder(AmazonS3Builder::from_env(), &config);
+        let cache_namespace = cache_namespace(&builder, &config.prefix);
         let store = builder.build().unwrap_or_else(|error| {
             eprintln!("Invalid s3 configuration: {error}");
             std::process::exit(1);
         });
         S3Backend {
-            store: Box::new(store),
+            store: Arc::new(store),
+            cache_namespace,
             prefix: config.prefix,
             cache_dir: CACHE_DIR.to_string(),
         }
     })
+}
+
+/// Apply only explicit TOML settings over the environment-derived builder.
+fn configure_builder(mut builder: AmazonS3Builder, config: &S3Config) -> AmazonS3Builder {
+    builder = builder.with_bucket_name(&config.bucket);
+    if let Some(region) = &config.region {
+        builder = builder.with_region(region);
+    }
+    if let Some(endpoint) = &config.endpoint {
+        // object_store gives the service-specific endpoint precedence.
+        builder = builder
+            .with_endpoint(endpoint)
+            .with_config(AmazonS3ConfigKey::S3Endpoint, endpoint);
+    }
+    if let (Some(key_id), Some(secret)) = (&config.access_key_id, &config.secret_access_key) {
+        builder = builder
+            .with_access_key_id(key_id)
+            .with_secret_access_key(secret);
+    }
+    if let Some(virtual_hosted) = config.virtual_hosted_style {
+        builder = builder.with_virtual_hosted_style_request(virtual_hosted);
+    }
+    if let Some(allow_http) = config.allow_http {
+        builder = builder.with_allow_http(allow_http);
+    }
+    builder
+}
+
+/// Namespace by the effective storage location, never by credentials. Rotating
+/// credentials must not invalidate cached data or put secrets in cache keys.
+fn cache_namespace(builder: &AmazonS3Builder, prefix: &str) -> String {
+    let endpoint = builder
+        .get_config_value(&AmazonS3ConfigKey::S3Endpoint)
+        .or_else(|| builder.get_config_value(&AmazonS3ConfigKey::Endpoint));
+    let location = [
+        endpoint,
+        builder.get_config_value(&AmazonS3ConfigKey::Region),
+        builder.get_config_value(&AmazonS3ConfigKey::Bucket),
+        builder.get_config_value(&AmazonS3ConfigKey::VirtualHostedStyleRequest),
+        builder.get_config_value(&AmazonS3ConfigKey::S3Express),
+        Some(prefix.to_string()),
+    ];
+    serde_json::to_string(&location).unwrap()
 }
 
 /// Upload tags as an S3 tag set. Empty unless KCI_STORAGE_ENABLE_UPLOAD_TAGS
@@ -180,10 +209,11 @@ fn quoted_etag(etag: &str) -> String {
 }
 
 /// Stream `data` to `path`. Anything smaller than one chunk goes up in a
-/// single PUT; larger streams use a multipart upload that is aborted on any
-/// error, so no partial object is committed and no upload is left dangling.
+/// single PUT; larger streams use an independently owned multipart upload.
+/// Errors and cancelled input trigger an explicit abort while the runtime is
+/// alive; failures to contact S3 during cleanup are logged.
 async fn upload_stream(
-    store: &dyn ObjectStore,
+    store: Arc<dyn ObjectStore>,
     path: &Path,
     data: &mut (dyn tokio::io::AsyncRead + Unpin + Send),
     cont_type: String,
@@ -212,51 +242,95 @@ async fn upload_stream(
         attributes,
         ..Default::default()
     };
+    // The worker owns the entire multipart lifetime, including initiation and
+    // completion. Dropping the request closes the channel, but never drops an
+    // upload future that still needs to complete or explicitly abort in S3.
+    let (sender, receiver) = mpsc::channel(1);
+    let path = path.clone();
+    let worker = tokio::spawn(async move {
+        let result = multipart_worker(store, path, options, first, receiver).await;
+        if let Err(error) = &result {
+            eprintln!("S3 multipart upload failed: {error}");
+        }
+        result
+    });
+    let streamed: Result<(), String> = async {
+        loop {
+            let mut buffer = vec![0u8; UPLOAD_CHUNK_SIZE];
+            let len = read_full_chunk(data, &mut buffer)
+                .await
+                .map_err(|e| e.to_string())?;
+            let message = if len == 0 {
+                UploadMessage::Finish
+            } else {
+                buffer.truncate(len);
+                UploadMessage::Chunk(Bytes::from(buffer))
+            };
+            if sender.send(message).await.is_err() || len == 0 {
+                return Ok(());
+            }
+        }
+    }
+    .await;
+    drop(sender);
+    // On read failure, wait for cleanup before returning. On cancellation the
+    // JoinHandle is detached, letting the worker finish that same cleanup.
+    let uploaded = worker
+        .await
+        .map_err(|e| format!("Upload task failed: {e}"))?;
+    streamed?;
+    uploaded
+}
+
+enum UploadMessage {
+    Chunk(Bytes),
+    Finish,
+}
+
+async fn multipart_worker(
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    options: PutMultipartOptions,
+    first: Vec<u8>,
+    mut receiver: mpsc::Receiver<UploadMessage>,
+) -> Result<usize, String> {
     let upload = store
-        .put_multipart_opts(path, options)
+        .put_multipart_opts(&path, options)
         .await
         .map_err(|e| format!("Multipart upload start failed: {e}"))?;
     let mut writer = WriteMultipart::new_with_chunk_size(upload, UPLOAD_CHUNK_SIZE);
     let mut total_bytes = first.len();
     writer.put(Bytes::from(first));
-
-    let streamed: Result<(), String> = async {
-        loop {
-            writer
-                .wait_for_capacity(UPLOAD_PARALLEL_PARTS)
-                .await
-                .map_err(|e| format!("Part upload failed: {e}"))?;
-            let mut buffer = vec![0u8; UPLOAD_CHUNK_SIZE];
-            let len = read_full_chunk(data, &mut buffer)
-                .await
-                .map_err(|e| e.to_string())?;
-            if len == 0 {
-                return Ok(());
+    let error = loop {
+        if let Err(e) = writer.wait_for_capacity(UPLOAD_PARALLEL_PARTS).await {
+            break format!("Part upload failed: {e}");
+        }
+        match receiver.recv().await {
+            Some(UploadMessage::Chunk(chunk)) => {
+                total_bytes += chunk.len();
+                writer.put(chunk);
             }
-            buffer.truncate(len);
-            writer.put(Bytes::from(buffer));
-            total_bytes += len;
+            Some(UploadMessage::Finish) => {
+                // finish() aborts on errors. This independently owned task also
+                // survives cancellation while completion or that abort awaits.
+                writer
+                    .finish()
+                    .await
+                    .map_err(|e| format!("Multipart upload failed: {e}"))?;
+                return Ok(total_bytes);
+            }
+            None => break "Upload input closed before EOF".to_string(),
         }
+    };
+    if let Err(abort_error) = writer.abort().await {
+        eprintln!("Error aborting multipart upload of {path}: {abort_error}");
     }
-    .await;
-
-    if let Err(e) = streamed {
-        if let Err(abort_error) = writer.abort().await {
-            eprintln!("Error aborting multipart upload of {path}: {abort_error}");
-        }
-        return Err(e);
-    }
-    // finish() aborts the upload itself when completing fails.
-    writer
-        .finish()
-        .await
-        .map_err(|e| format!("Multipart upload failed: {e}"))?;
-    Ok(total_bytes)
+    Err(error)
 }
 
 impl S3Backend {
     /// Normalized object key for `filename`: the same form main.rs uses for
-    /// locks (`storage_key`), and what the cache entry is hashed from.
+    /// locks (`storage_key`). The cache additionally includes its location.
     fn key(&self, filename: &str) -> Result<String, String> {
         let key = crate::normalize_storage_path(filename)?;
         if key.is_empty() {
@@ -265,8 +339,7 @@ impl S3Backend {
         Ok(key)
     }
 
-    /// Location of `key` in the bucket. The optional prefix applies here only,
-    /// not to the cache key.
+    /// Location of `key` in the bucket. The prefix is also part of the cache namespace.
     fn path(&self, key: &str) -> Result<Path, String> {
         let full = if self.prefix.is_empty() {
             key.to_string()
@@ -274,6 +347,10 @@ impl S3Backend {
             format!("{}/{}", self.prefix, key)
         };
         Path::parse(full).map_err(|e| e.to_string())
+    }
+
+    fn cache_key(&self, key: &str) -> String {
+        objcache::scoped_key("s3", &[&self.cache_namespace], key)
     }
 
     async fn write_streaming(
@@ -286,8 +363,8 @@ impl S3Backend {
         let key = self.key(filename)?;
         let path = self.path(&key)?;
         // A re-upload must not keep serving the previous cached copy.
-        objcache::invalidate(&self.cache_dir, &key)?;
-        upload_stream(self.store.as_ref(), &path, data, cont_type, tags).await
+        objcache::invalidate(&self.cache_dir, &self.cache_key(&key))?;
+        upload_stream(self.store.clone(), &path, data, cont_type, tags).await
     }
 
     async fn get_file(&self, filename: String) -> ReceivedFile {
@@ -299,7 +376,8 @@ impl S3Backend {
                 return not_found();
             }
         };
-        match objcache::lookup(&self.cache_dir, &filename, &key).await {
+        let cache_key = self.cache_key(&key);
+        match objcache::lookup(&self.cache_dir, &filename, &cache_key).await {
             Ok(Some(hit)) => return hit,
             Ok(None) => {}
             Err(()) => return not_found(),
@@ -342,7 +420,7 @@ impl S3Backend {
         objcache::store(
             &self.cache_dir,
             &filename,
-            &key,
+            &cache_key,
             headers,
             result.into_stream(),
         )
@@ -411,7 +489,11 @@ mod tests {
     fn backend(cache: &tempfile::TempDir, prefix: &str) -> S3Backend {
         crate::storcaching::prepare_cache_layout(cache.path().to_str().unwrap()).unwrap();
         S3Backend {
-            store: Box::new(InMemory::new()),
+            store: Arc::new(InMemory::new()),
+            cache_namespace: cache_namespace(
+                &AmazonS3Builder::new().with_bucket_name("test"),
+                prefix,
+            ),
             prefix: prefix.to_string(),
             cache_dir: cache.path().to_str().unwrap().to_string(),
         }
@@ -466,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn uploads_store_exact_bytes_and_content_type() {
-        let store = InMemory::new();
+        let store = Arc::new(InMemory::new());
         for size in [
             0,
             16,
@@ -478,7 +560,7 @@ mod tests {
             let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
             let mut input = std::io::Cursor::new(data.clone());
             let uploaded = upload_stream(
-                &store,
+                store.clone(),
                 &path,
                 &mut input,
                 "text/plain".to_string(),
@@ -502,11 +584,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_reads_leave_no_object() {
-        let store = InMemory::new();
+        let store = Arc::new(InMemory::new());
         let path = Path::parse("broken").unwrap();
         // Before anything is sent.
         assert!(upload_stream(
-            &store,
+            store.clone(),
             &path,
             &mut FailedRead,
             "a/b".to_string(),
@@ -520,7 +602,7 @@ mod tests {
             FailedRead,
         );
         assert!(upload_stream(
-            &store,
+            store.clone(),
             &path,
             &mut input,
             "a/b".to_string(),
@@ -637,3 +719,6 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod regression_tests;
