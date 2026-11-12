@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Isolate remote cache entries by backend and storage location, including S3
+  bucket/prefix and Azure account/container; ignore legacy filename-only entries.
+- Keep S3 multipart cleanup alive when a request is cancelled, including during
+  initiation and completion.
+- Honor explicit S3 endpoints over service-specific environment endpoints and
+  preserve environment addressing style when the TOML setting is omitted.
+
 ### Added
 - S3-compatible storage backend (`driver="s3"`, `[s3]` section) for AWS S3,
   MinIO, Garage, Hetzner, Cloudflare R2 and others, built on `object_store`.

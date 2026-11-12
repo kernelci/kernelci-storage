@@ -21,8 +21,18 @@ use tokio::io::AsyncWriteExt;
 /// Cache root, relative to the working directory.
 pub(crate) const CACHE_DIR: &str = "cache";
 
-/// Content and headers paths for `key`, which must already be normalized the
-/// way the driver addresses the object, so aliases share one entry.
+/// Include the backend and its storage location without ambiguous separators.
+/// The NUL version marker cannot occur in a validated legacy filename, so old
+/// filename-only entries are never reused after upgrading.
+pub(crate) fn scoped_key(backend: &str, location: &[&str], key: &str) -> String {
+    format!(
+        "v2\0{}",
+        serde_json::to_string(&(backend, location, key)).unwrap()
+    )
+}
+
+/// Content and headers paths for `key`. Remote drivers supply a scoped key
+/// containing their location and normalized object name, so aliases share an entry.
 pub(crate) fn cache_paths(cache_dir: &str, key: &str) -> (PathBuf, PathBuf) {
     let hash = sha2_512::default().update(key.as_bytes()).finalize();
     crate::storcaching::cache_file_paths(cache_dir, &hash.digest().to_hex_lowercase())

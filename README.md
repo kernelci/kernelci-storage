@@ -57,7 +57,7 @@ region="us-east-1"             # optional, defaults to "us-east-1" (Garage: "gar
 endpoint="https://s3.example"  # optional; set for anything that is not AWS
 access_key_id="..."            # optional, together with secret_access_key
 secret_access_key="..."
-virtual_hosted_style=false     # optional, defaults to path-style requests
+virtual_hosted_style=false     # optional; else AWS_VIRTUAL_HOSTED_STYLE_REQUEST (default false)
 allow_http=false               # optional, allow a plain-HTTP endpoint
 prefix=""                      # optional key prefix inside the bucket
 ```
@@ -65,7 +65,18 @@ prefix=""                      # optional key prefix inside the bucket
 Settings left out of `[s3]` fall back to the standard `AWS_*` environment
 variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 `AWS_REGION`, `AWS_ENDPOINT`, ...), which also covers IAM roles and IRSA.
-Values in the config file take precedence.
+Values in the config file take precedence. An explicit `endpoint` overrides
+both `AWS_ENDPOINT`/`AWS_ENDPOINT_URL` and `AWS_ENDPOINT_URL_S3`.
+
+Cache entries include the backend and storage location (S3 endpoint, region,
+bucket, addressing style and prefix; Azure account and container). Changing
+location cannot reuse another location's cached bytes. Older filename-only
+cache entries are ignored and are eventually removed by normal housekeeping.
+
+Cancelled multipart requests abort their upload in a background task. If the
+entire body has already been handed off for completion, that task finishes the
+upload or aborts on failure. Process termination or failed abort requests can
+still leave parts behind; use an S3 lifecycle rule to expire incomplete uploads.
 
 Example for a local MinIO or Garage instance:
 
